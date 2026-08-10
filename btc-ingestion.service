@@ -1,0 +1,16 @@
+[Unit]
+Description=BTC Kalshi predictor - ingestion service
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/btc-kalshi-predictor
+Environment=AWS_REGION=us-east-1
+Environment=MODEL_BUCKET=btc-kalshi-model-artifacts-tom-8291
+ExecStart=/usr/bin/python3 run_ingestion.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
