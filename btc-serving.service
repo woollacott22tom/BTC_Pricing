@@ -1,0 +1,17 @@
+[Unit]
+Description=BTC Kalshi predictor - live scoring API
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/btc-kalshi-predictor
+Environment=AWS_REGION=us-east-1
+Environment=MODEL_BUCKET=btc-kalshi-model-artifacts-tom-8291
+Environment=COINBASE_SECRET_NAME=btc-kalshi/coinbase-api-key
+ExecStart=/usr/local/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
