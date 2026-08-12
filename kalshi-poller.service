@@ -1,0 +1,15 @@
+[Unit]
+Description=Kalshi BTC 15-min price poller
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/btc-kalshi-predictor
+Environment=AWS_REGION=us-east-1
+ExecStart=/usr/bin/python3 kalshi_poller.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
