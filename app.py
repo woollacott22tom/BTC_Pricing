@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timezone
 
 import websockets
+import requests
 import xgboost as xgb
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,6 +74,20 @@ KRAKEN_STATE = {
     "buf": RollingBuffer(max_seconds=900),
     "window_id": None,
     "strike_price": None,
+}
+
+KALSHI_BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
+KALSHI_SERIES_TICKER = "KXBTC15M"
+KALSHI_POLL_INTERVAL_SEC = 3.0
+
+KALSHI_STATE = {
+    "strike": None,   # Kalshi's own "floor_strike" -- the actual settlement
+                       # threshold/target, labeled "Target" in their UI. This
+                       # is the real number that determines up/down, not our
+                       # own locally-observed window-open price.
+    "ticker": None,
+    "yes_bid_cents": None,
+    "yes_ask_cents": None,
 }
 
 
@@ -211,11 +226,46 @@ async def kraken_feed_loop():
             backoff = min(backoff * 2, 30.0)
 
 
+async def kalshi_poll_loop():
+    """Polls Kalshi's public REST API for the currently open KXBTC15M
+    market's floor_strike (the real settlement threshold/"Target" in their
+    UI) -- this is a much lighter-weight poll than the full kalshi_poller.py
+    service, since the dashboard only needs the strike + current bid/ask,
+    not a full historical price log."""
+    while True:
+        try:
+            resp = requests.get(
+                f"{KALSHI_BASE_URL}/markets",
+                params={"series_ticker": KALSHI_SERIES_TICKER, "status": "open", "limit": 5},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            markets = resp.json().get("markets", [])
+            if markets:
+                m = markets[0]
+                strike = m.get("floor_strike")
+                yes_bid = m.get("yes_bid_dollars")
+                yes_ask = m.get("yes_ask_dollars")
+
+                if strike is not None:
+                    KALSHI_STATE["strike"] = float(strike)
+                KALSHI_STATE["ticker"] = m.get("ticker")
+                if yes_bid is not None:
+                    KALSHI_STATE["yes_bid_cents"] = float(yes_bid) * 100.0
+                if yes_ask is not None:
+                    KALSHI_STATE["yes_ask_cents"] = float(yes_ask) * 100.0
+        except Exception as e:
+            log.warning(f"[serving/kalshi] poll error: {e}")
+
+        await asyncio.sleep(KALSHI_POLL_INTERVAL_SEC)
+
+
 @app.on_event("startup")
 async def startup():
     load_models()
     asyncio.create_task(feed_loop())
     asyncio.create_task(kraken_feed_loop())
+    asyncio.create_task(kalshi_poll_loop())
 
 
 @app.get("/health")
@@ -244,6 +294,10 @@ def live():
         "directional": None,
         "flip": None,
         "kraken": None,
+        "kalshi_strike": KALSHI_STATE["strike"],
+        "kalshi_ticker": KALSHI_STATE["ticker"],
+        "kalshi_yes_bid_cents": KALSHI_STATE["yes_bid_cents"],
+        "kalshi_yes_ask_cents": KALSHI_STATE["yes_ask_cents"],
     }
 
     kraken_buf = KRAKEN_STATE["buf"]
