@@ -32,18 +32,25 @@ from window_utils import window_id_for, seconds_remaining
 from compute import Tick, RollingBuffer, compute_feature_snapshot
 from order_book import OrderBook
 from jwt_auth import build_ws_jwt
+from kraken_order_book import KrakenOrderBook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("serving")
 
 ADVANCED_TRADE_WS = "wss://advanced-trade-ws.coinbase.com"
 PRODUCT_ID = "BTC-USD"
+KRAKEN_WS = "wss://ws.kraken.com/v2"
+KRAKEN_SYMBOL = "BTC/USD"
 ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
 FEATURE_COLS_PATH = os.path.join(ARTIFACT_DIR, "metadata.json")
 
 
 def _subscribe_msg(channel: str) -> dict:
     return {"type": "subscribe", "product_ids": [PRODUCT_ID], "channel": channel, "jwt": build_ws_jwt()}
+
+
+def _kraken_subscribe_msg(channel: str) -> dict:
+    return {"method": "subscribe", "params": {"channel": channel, "symbol": [KRAKEN_SYMBOL]}}
 
 
 app = FastAPI(title="BTC 15-min Predictor")
@@ -60,6 +67,12 @@ STATE = {
     "directional_model": None,
     "flip_model": None,
     "feature_cols": [],
+}
+
+KRAKEN_STATE = {
+    "buf": RollingBuffer(max_seconds=900),
+    "window_id": None,
+    "strike_price": None,
 }
 
 
@@ -144,10 +157,65 @@ async def feed_loop():
             backoff = min(backoff * 2, 30.0)
 
 
+async def kraken_feed_loop():
+    """Background task: same pattern as feed_loop(), but for Kraken --
+    fully independent buffer/window/strike tracking, so an issue on one
+    exchange's connection can never affect the other."""
+    backoff = 1.0
+    while True:
+        try:
+            async with websockets.connect(KRAKEN_WS, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+                backoff = 1.0
+                await ws.send(json.dumps(_kraken_subscribe_msg("trade")))
+                await ws.send(json.dumps(_kraken_subscribe_msg("book")))
+                book = KrakenOrderBook()
+
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    channel = msg.get("channel")
+                    now = datetime.now(timezone.utc)
+                    now_ts = now.timestamp()
+
+                    if channel == "book":
+                        msg_type = msg.get("type")
+                        for entry in msg.get("data", []):
+                            book.apply_message(msg_type, entry)
+
+                    elif channel == "trade":
+                        for entry in msg.get("data", []):
+                            try:
+                                price = float(entry["price"])
+                                volume = float(entry["qty"])
+                            except (KeyError, TypeError, ValueError):
+                                continue
+
+                            tick = Tick(
+                                ts=now_ts, price=price, volume=volume,
+                                best_bid=book.best_bid(), best_ask=book.best_ask(),
+                                bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
+                                bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                                bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                                bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
+                            )
+                            KRAKEN_STATE["buf"].add(tick)
+
+                            wid = window_id_for(now)
+                            if KRAKEN_STATE["window_id"] != wid:
+                                KRAKEN_STATE["window_id"] = wid
+                                KRAKEN_STATE["strike_price"] = price
+                                log.info(f"[serving/kraken] window rolled: {wid} strike={price}")
+
+        except Exception as e:
+            log.error(f"[serving/kraken] feed error: {e}, retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
 @app.on_event("startup")
 async def startup():
     load_models()
     asyncio.create_task(feed_loop())
+    asyncio.create_task(kraken_feed_loop())
 
 
 @app.get("/health")
@@ -175,7 +243,18 @@ def live():
         "features": feats,
         "directional": None,
         "flip": None,
+        "kraken": None,
     }
+
+    kraken_buf = KRAKEN_STATE["buf"]
+    if kraken_buf.ticks and KRAKEN_STATE["strike_price"] is not None:
+        kraken_feats = compute_feature_snapshot(kraken_buf, KRAKEN_STATE["strike_price"], now_ts)
+        result["kraken"] = {
+            "window_id": KRAKEN_STATE["window_id"],
+            "strike_price": KRAKEN_STATE["strike_price"],
+            "current_price": kraken_feats.get("price"),
+            "features": kraken_feats,
+        }
 
     cols = STATE["feature_cols"]
     if STATE["directional_model"] is not None and cols:

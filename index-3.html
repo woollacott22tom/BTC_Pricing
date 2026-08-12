@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTC / 15m — Live</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600&display=swap');
+
+  :root {
+    --ink: #0a0c0f;
+    --ink-raised: #12151a;
+    --hairline: #23272f;
+    --amber: #e8a548;
+    --amber-dim: #7a5a2c;
+    --up: #4fae6d;
+    --down: #c85a4f;
+    --text: #d8dade;
+    --text-dim: #6b7078;
+    --kraken-blue: #7ec8e3;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--ink);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif;
+    min-height: 100vh;
+    padding: 20px 16px 60px;
+  }
+
+  .wrap { max-width: 480px; margin: 0 auto; }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 24px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .ticker-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.12em;
+    color: var(--amber);
+    text-transform: uppercase;
+  }
+
+  .conn-dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    margin-right: 6px;
+    position: relative;
+    top: -1px;
+  }
+  .conn-dot.live { background: var(--up); box-shadow: 0 0 6px var(--up); }
+  .conn-dot.stale { background: var(--down); }
+
+  .status-text {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .price-block {
+    text-align: center;
+    padding: 28px 0 24px;
+  }
+
+  .price-block .label {
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .price-block .price {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 44px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  .price-block .delta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 15px;
+    margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .delta.up { color: var(--up); }
+  .delta.down { color: var(--down); }
+
+  .kraken-price-block {
+    text-align: center;
+    padding: 0 0 24px;
+  }
+
+  .kraken-price-block .label {
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .kraken-price-block .price {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 28px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+    color: var(--kraken-blue);
+  }
+
+  .kraken-price-block .delta {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .v-kraken {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--kraken-blue);
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .countdown-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 28px;
+  }
+
+  .countdown {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  .countdown.final-minute { color: var(--down); }
+
+  .track {
+    height: 3px;
+    background: var(--hairline);
+    border-radius: 2px;
+    overflow: hidden;
+    width: 100px;
+  }
+  .track-fill {
+    height: 100%;
+    background: var(--amber-dim);
+    transition: width 1s linear;
+  }
+  .track-fill.final-minute { background: var(--down); }
+
+  .panel {
+    background: var(--ink-raised);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+
+  .panel-title {
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 16px;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .prob-bar {
+    height: 34px;
+    border-radius: 4px;
+    overflow: hidden;
+    display: flex;
+    border: 1px solid var(--hairline);
+    margin-bottom: 10px;
+  }
+
+  .prob-seg {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    transition: width 0.6s ease;
+  }
+  .prob-seg.up-seg { background: rgba(79, 174, 109, 0.18); color: var(--up); }
+  .prob-seg.down-seg { background: rgba(200, 90, 79, 0.18); color: var(--down); }
+
+  .prob-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .flip-panel {
+    display: none;
+  }
+  .flip-panel.active { display: block; }
+
+  .flip-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 32px;
+    font-weight: 700;
+    color: var(--down);
+    text-align: center;
+    margin: 8px 0 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .flip-caption {
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+  }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px 20px;
+  }
+
+  .feature-item {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+    border-bottom: 1px dotted var(--hairline);
+    padding-bottom: 6px;
+  }
+
+  .feature-item .k { color: var(--text-dim); }
+  .feature-item .v { font-weight: 500; }
+  .v-wrap { display: flex; flex-direction: column; align-items: flex-end; }
+
+  .config-note {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-align: center;
+    margin-top: 24px;
+    line-height: 1.6;
+  }
+  .config-note code {
+    font-family: 'JetBrains Mono', monospace;
+    background: var(--ink-raised);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="ticker-label">BTC · 15M</div>
+    <div class="status-text"><span class="conn-dot" id="connDot"></span><span id="connText">connecting</span></div>
+  </header>
+
+  <div class="price-block">
+    <div class="label">Current Price</div>
+    <div class="price" id="price">—</div>
+    <div class="delta" id="delta">—</div>
+  </div>
+
+  <div class="kraken-price-block">
+    <div class="label">Kraken</div>
+    <div class="price" id="krakenPrice">—</div>
+    <div class="delta" id="krakenDelta">—</div>
+  </div>
+
+  <div class="countdown-row">
+    <div class="track"><div class="track-fill" id="trackFill" style="width: 100%"></div></div>
+    <div class="countdown" id="countdown">— remaining</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title"><span>Direction</span><span id="dirMeta"></span></div>
+    <div class="prob-bar">
+      <div class="prob-seg down-seg" id="downSeg" style="width: 50%">—</div>
+      <div class="prob-seg up-seg" id="upSeg" style="width: 50%">—</div>
+    </div>
+    <div class="prob-labels"><span>DOWN</span><span>UP</span></div>
+  </div>
+
+  <div class="panel flip-panel" id="flipPanel">
+    <div class="panel-title"><span>Flip Risk</span><span>final 90s</span></div>
+    <div class="flip-value" id="flipValue">—</div>
+    <div class="flip-caption">Estimated probability the settlement average still crosses the strike before close.</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title"><span>Window</span></div>
+    <div class="feature-grid" id="featureGrid">
+      <div class="feature-item"><span class="k">strike</span><span class="v-wrap"><span class="v" id="fStrike">—</span><span class="v-kraken" id="fStrikeKraken">—</span></span></div>
+      <div class="feature-item"><span class="k">vol 15s</span><span class="v-wrap"><span class="v" id="fVol15">—</span><span class="v-kraken" id="fVol15Kraken">—</span></span></div>
+      <div class="feature-item"><span class="k">imbalance top-5</span><span class="v-wrap"><span class="v" id="fImb5">—</span><span class="v-kraken" id="fImb5Kraken">—</span></span></div>
+      <div class="feature-item"><span class="k">imbalance top-10</span><span class="v-wrap"><span class="v" id="fImb10">—</span><span class="v-kraken" id="fImb10Kraken">—</span></span></div>
+      <div class="feature-item"><span class="k">imbalance top-20</span><span class="v-wrap"><span class="v" id="fImb20">—</span><span class="v-kraken" id="fImb20Kraken">—</span></span></div>
+      <div class="feature-item"><span class="k">imbalance top-50</span><span class="v-wrap"><span class="v" id="fImb50">—</span><span class="v-kraken" id="fImb50Kraken">—</span></span></div>
+      <div class="feature-item"><span class="k">spread Δ (10s)</span><span class="v-wrap"><span class="v" id="fSpreadChange">—</span><span class="v-kraken" id="fSpreadChangeKraken">—</span></span></div>
+      <div class="feature-item"><span class="k">spread z-score</span><span class="v-wrap"><span class="v" id="fSpreadZ">—</span><span class="v-kraken" id="fSpreadZKraken">—</span></span></div>
+    </div>
+  </div>
+
+  <div class="config-note">
+    Polling <code id="apiUrlDisplay">—</code> every 2s.
+    Edit <code>API_URL</code> in this file to point at your instance.
+  </div>
+
+</div>
+
+<script>
+  // ---- Configuration ----
+  // Point this at your EC2 box's serving API. Must be HTTPS if this page is
+  // served over HTTPS (GitHub Pages always is) — plain http:// will be
+  // blocked by the browser as mixed content.
+  const API_URL = "https://3-87-119-205.sslip.io/live";
+
+  document.getElementById('apiUrlDisplay').textContent = API_URL;
+
+  let lastFetchOk = false;
+
+  function fmtUsd(n) {
+    if (n === null || n === undefined || isNaN(n)) return "—";
+    return "$" + Number(n).toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 });
+  }
+
+  function fmtPct(n) {
+    if (n === null || n === undefined || isNaN(n)) return "—";
+    return (n * 100).toFixed(1) + "%";
+  }
+
+  function fmtSecs(s) {
+    if (s === null || s === undefined || isNaN(s)) return "—";
+    s = Math.max(0, Math.round(s));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${r.toString().padStart(2, '0')} remaining`;
+  }
+
+  function setConn(ok) {
+    const dot = document.getElementById('connDot');
+    const text = document.getElementById('connText');
+    lastFetchOk = ok;
+    if (ok) {
+      dot.className = 'conn-dot live';
+      text.textContent = 'live';
+    } else {
+      dot.className = 'conn-dot stale';
+      text.textContent = 'disconnected';
+    }
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch(API_URL, { cache: "no-store" });
+      if (!res.ok) throw new Error("bad response");
+      const data = await res.json();
+      setConn(true);
+      render(data);
+    } catch (e) {
+      setConn(false);
+    }
+  }
+
+  function render(data) {
+    if (data.status === "warming_up") {
+      document.getElementById('price').textContent = "warming up…";
+      return;
+    }
+
+    const price = data.current_price;
+    const strike = data.strike_price;
+    document.getElementById('price').textContent = fmtUsd(price);
+
+    const deltaEl = document.getElementById('delta');
+    if (price != null && strike != null) {
+      const diff = price - strike;
+      const pct = (diff / strike) * 100;
+      const sign = diff >= 0 ? "+" : "";
+      deltaEl.textContent = `${sign}${fmtUsd(diff).replace('$', '$')} (${sign}${pct.toFixed(3)}%) vs strike`;
+      deltaEl.className = "delta " + (diff >= 0 ? "up" : "down");
+    }
+
+    // Kraken price + delta from Kraken's own strike (independent window/strike tracking)
+    const kraken = data.kraken;
+    const krakenPriceEl = document.getElementById('krakenPrice');
+    const krakenDeltaEl = document.getElementById('krakenDelta');
+    if (kraken && kraken.current_price != null && kraken.strike_price != null) {
+      krakenPriceEl.textContent = fmtUsd(kraken.current_price);
+      const kDiff = kraken.current_price - kraken.strike_price;
+      const kPct = (kDiff / kraken.strike_price) * 100;
+      const kSign = kDiff >= 0 ? "+" : "";
+      krakenDeltaEl.textContent = `${kSign}${fmtUsd(kDiff).replace('$', '$')} (${kSign}${kPct.toFixed(3)}%) vs strike`;
+      krakenDeltaEl.className = "delta " + (kDiff >= 0 ? "up" : "down");
+    } else {
+      krakenPriceEl.textContent = "—";
+      krakenDeltaEl.textContent = "—";
+      krakenDeltaEl.className = "delta";
+    }
+
+    const secsRemaining = data.seconds_remaining;
+    document.getElementById('countdown').textContent = fmtSecs(secsRemaining);
+    const isFinalMinute = secsRemaining != null && secsRemaining <= 60;
+    document.getElementById('countdown').className = "countdown" + (isFinalMinute ? " final-minute" : "");
+    const fillPct = secsRemaining != null ? Math.max(0, Math.min(100, (secsRemaining / 900) * 100)) : 100;
+    const fillEl = document.getElementById('trackFill');
+    fillEl.style.width = fillPct + "%";
+    fillEl.className = "track-fill" + (isFinalMinute ? " final-minute" : "");
+
+    // Directional
+    if (data.directional && data.directional.p_up != null) {
+      const pUp = data.directional.p_up;
+      const pDown = 1 - pUp;
+      document.getElementById('upSeg').style.width = (pUp * 100) + "%";
+      document.getElementById('downSeg').style.width = (pDown * 100) + "%";
+      document.getElementById('upSeg').textContent = fmtPct(pUp);
+      document.getElementById('downSeg').textContent = fmtPct(pDown);
+      document.getElementById('dirMeta').textContent = "model P(up)";
+    } else {
+      document.getElementById('dirMeta').textContent = "no model loaded";
+    }
+
+    // Flip risk (only meaningful/shown in final 90s)
+    const flipPanel = document.getElementById('flipPanel');
+    if (data.flip && data.flip.p_flip != null) {
+      flipPanel.classList.add('active');
+      document.getElementById('flipValue').textContent = fmtPct(data.flip.p_flip);
+    } else {
+      flipPanel.classList.remove('active');
+    }
+
+    // Feature grid
+    const f = data.features || {};
+    document.getElementById('fStrike').textContent = fmtUsd(strike);
+    document.getElementById('fVol15').textContent = f.realized_vol_15s != null ? f.realized_vol_15s.toExponential(2) : "—";
+
+    // Multi-tier depth / spread pattern panel
+    document.getElementById('fImb5').textContent = f.imbalance_5 != null ? f.imbalance_5.toFixed(3) : "—";
+    document.getElementById('fImb10').textContent = f.book_imbalance != null ? f.book_imbalance.toFixed(3) : "—";
+    document.getElementById('fImb20').textContent = f.imbalance_20 != null ? f.imbalance_20.toFixed(3) : "—";
+    document.getElementById('fImb50').textContent = f.imbalance_50 != null ? f.imbalance_50.toFixed(3) : "—";
+    document.getElementById('fSpreadChange').textContent = f.spread_change_rate_10s != null
+      ? (f.spread_change_rate_10s * 100).toFixed(1) + "%" : "—";
+    document.getElementById('fSpreadZ').textContent = f.spread_zscore_60s != null ? f.spread_zscore_60s.toFixed(2) + "σ" : "—";
+
+    // Kraken values for the same feature set, shown in light blue beneath each Coinbase value
+    const kf = (kraken && kraken.features) || {};
+    document.getElementById('fStrikeKraken').textContent = kraken && kraken.strike_price != null ? fmtUsd(kraken.strike_price) : "—";
+    document.getElementById('fVol15Kraken').textContent = kf.realized_vol_15s != null ? kf.realized_vol_15s.toExponential(2) : "—";
+    document.getElementById('fImb5Kraken').textContent = kf.imbalance_5 != null ? kf.imbalance_5.toFixed(3) : "—";
+    document.getElementById('fImb10Kraken').textContent = kf.book_imbalance != null ? kf.book_imbalance.toFixed(3) : "—";
+    document.getElementById('fImb20Kraken').textContent = kf.imbalance_20 != null ? kf.imbalance_20.toFixed(3) : "—";
+    document.getElementById('fImb50Kraken').textContent = kf.imbalance_50 != null ? kf.imbalance_50.toFixed(3) : "—";
+    document.getElementById('fSpreadChangeKraken').textContent = kf.spread_change_rate_10s != null
+      ? (kf.spread_change_rate_10s * 100).toFixed(1) + "%" : "—";
+    document.getElementById('fSpreadZKraken').textContent = kf.spread_zscore_60s != null ? kf.spread_zscore_60s.toFixed(2) + "σ" : "—";
+  }
+
+  poll();
+  setInterval(poll, 2000);
+</script>
+</body>
+</html>
