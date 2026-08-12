@@ -168,51 +168,101 @@ def distance_to_strike_in_stdevs(current_price: float, strike_price: float, vol_
     return log_dist / vol_1s
 
 
-def local_extrema_count(ticks: list[Tick]) -> int | None:
-    """Number of local peaks/troughs (direction changes) in the price path.
-    A rough, unbiased stand-in for 'choppiness' or pattern complexity --
-    doesn't try to name a specific chart pattern (head-and-shoulders, etc.),
-    just counts how many times the price direction reversed. Choppy/complex
-    paths have more; smooth trends have fewer."""
-    if len(ticks) < 3:
+def _extrema_count(values: np.ndarray) -> int | None:
+    """Number of local peaks/troughs (direction changes) in a numeric
+    series. Generic core shared by both price-shape and spread-shape
+    features -- a rough, unbiased stand-in for 'choppiness' or pattern
+    complexity, without trying to name a specific chart pattern
+    (head-and-shoulders, bull flag, etc.), which tend to be too subjective
+    to encode reliably. Choppy/complex paths have more; smooth trends have
+    fewer."""
+    if len(values) < 3:
         return None
-    prices = np.array([t.price for t in ticks], dtype=float)
-    diffs = np.diff(prices)
+    diffs = np.diff(values)
     signs = np.sign(diffs)
     signs = signs[signs != 0]  # ignore flat/no-change steps
     if len(signs) < 2:
         return 0
-    direction_changes = np.sum(signs[1:] != signs[:-1])
-    return int(direction_changes)
+    return int(np.sum(signs[1:] != signs[:-1]))
+
+
+def _curvature(values: np.ndarray) -> float | None:
+    """Mean absolute second difference, normalized by the series' first
+    value. High curvature = the series is bending/whipsawing a lot; low
+    curvature = smooth, straight-line-like movement."""
+    if len(values) < 3 or values[0] == 0:
+        return None
+    second_diffs = np.diff(values, n=2)
+    return float(np.mean(np.abs(second_diffs)) / values[0])
+
+
+def _ma_cross_count(values: np.ndarray, ma_window: int) -> int | None:
+    """Number of times the series crosses its own trailing moving average
+    -- a simple proxy for 'oscillating around a level' (more crosses) vs
+    'trending away from it' (fewer crosses)."""
+    if len(values) < ma_window + 2:
+        return None
+    ma = np.convolve(values, np.ones(ma_window) / ma_window, mode="valid")
+    aligned = values[ma_window - 1:]
+    above = aligned > ma
+    if len(above) < 2:
+        return 0
+    return int(np.sum(above[1:] != above[:-1]))
+
+
+def local_extrema_count(ticks: list[Tick]) -> int | None:
+    """Price-path version -- see _extrema_count for the generic core."""
+    if len(ticks) < 3:
+        return None
+    return _extrema_count(np.array([t.price for t in ticks], dtype=float))
 
 
 def path_curvature(ticks: list[Tick]) -> float | None:
-    """Mean absolute second difference of price, normalized by price level.
-    High curvature = price path is bending/whipsawing a lot; low curvature
-    = smooth, straight-line-like movement (trend-like)."""
+    """Price-path version -- see _curvature for the generic core."""
     if len(ticks) < 3:
         return None
-    prices = np.array([t.price for t in ticks], dtype=float)
-    if prices[0] == 0:
-        return None
-    second_diffs = np.diff(prices, n=2)
-    return float(np.mean(np.abs(second_diffs)) / prices[0])
+    return _curvature(np.array([t.price for t in ticks], dtype=float))
 
 
 def ma_cross_count(ticks: list[Tick], ma_window: int = 5) -> int | None:
-    """Number of times price crosses its own trailing moving average --
-    a simple proxy for 'is price oscillating around a level' (more crosses)
-    vs 'is price trending away from it' (fewer crosses)."""
+    """Price-path version -- see _ma_cross_count for the generic core."""
     if len(ticks) < ma_window + 2:
         return None
-    prices = np.array([t.price for t in ticks], dtype=float)
-    ma = np.convolve(prices, np.ones(ma_window) / ma_window, mode="valid")
-    aligned_prices = prices[ma_window - 1:]
-    above = aligned_prices > ma
-    if len(above) < 2:
-        return 0
-    crosses = np.sum(above[1:] != above[:-1])
-    return int(crosses)
+    return _ma_cross_count(np.array([t.price for t in ticks], dtype=float), ma_window)
+
+
+def spread_local_extrema_count(ticks: list[Tick]) -> int | None:
+    """Same pattern-shape idea as local_extrema_count, applied to the
+    bid-ask SPREAD's own path instead of price. A choppy, oscillating
+    spread (market makers repeatedly widening/narrowing) looks different
+    from a spread that's smoothly and steadily widening or narrowing --
+    this distinguishes those cases without naming a specific pattern."""
+    spreads = [spread(t) for t in ticks]
+    spreads = [s for s in spreads if s is not None]
+    if len(spreads) < 3:
+        return None
+    return _extrema_count(np.array(spreads, dtype=float))
+
+
+def spread_curvature(ticks: list[Tick]) -> float | None:
+    """Curvature of the spread's own path -- see path_curvature for the
+    price-path analog."""
+    spreads = [spread(t) for t in ticks]
+    spreads = [s for s in spreads if s is not None]
+    if len(spreads) < 3:
+        return None
+    return _curvature(np.array(spreads, dtype=float))
+
+
+def spread_ma_cross_count(ticks: list[Tick], ma_window: int = 5) -> int | None:
+    """How often the spread crosses its own trailing moving average --
+    frequent crossing suggests the spread is oscillating/noisy rather than
+    trending steadily wider or narrower."""
+    spreads = [spread(t) for t in ticks]
+    spreads = [s for s in spreads if s is not None]
+    if len(spreads) < ma_window + 2:
+        return None
+    return _ma_cross_count(np.array(spreads, dtype=float), ma_window)
 
 
 def recent_range_ratio(buf: RollingBuffer, now_ts: float, recent_seconds: float = 15.0, prior_seconds: float = 30.0) -> float | None:
@@ -276,5 +326,8 @@ def compute_feature_snapshot(buf: RollingBuffer, strike_price: float, now_ts: fl
         "imbalance_50": tier_imbalance(last, 50),
         "spread_change_rate_10s": spread_change_rate(buf, now_ts, 10.0),
         "spread_zscore_60s": spread_zscore(buf, now_ts, 60.0),
+        "spread_local_extrema_60s": spread_local_extrema_count(win_60s),
+        "spread_curvature_60s": spread_curvature(win_60s),
+        "spread_ma_cross_60s": spread_ma_cross_count(win_60s, ma_window=5),
     }
     return feat
