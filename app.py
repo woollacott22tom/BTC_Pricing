@@ -126,6 +126,9 @@ async def feed_loop():
                                     best_bid=book.best_bid(), best_ask=book.best_ask(),
                                     bid_depth_top10=book.top10_bid_depth(),
                                     ask_depth_top10=book.top10_ask_depth(),
+                                    bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                                    bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                                    bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
                                 )
                                 STATE["buf"].add(tick)
 

@@ -148,6 +148,9 @@ async def run():
                                 best_bid=book.best_bid(), best_ask=book.best_ask(),
                                 bid_depth_top10=book.top10_bid_depth(),
                                 ask_depth_top10=book.top10_ask_depth(),
+                                bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                                bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                                bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
                             )
                             buf.add(tick)
 
@@ -170,6 +173,9 @@ async def run():
                                         "best_bid": tick.best_bid, "best_ask": tick.best_ask,
                                         "bid_depth_top10": tick.bid_depth_top10,
                                         "ask_depth_top10": tick.ask_depth_top10,
+                                        "bid_depth_5": tick.bid_depth_5, "ask_depth_5": tick.ask_depth_5,
+                                        "bid_depth_20": tick.bid_depth_20, "ask_depth_20": tick.ask_depth_20,
+                                        "bid_depth_50": tick.bid_depth_50, "ask_depth_50": tick.ask_depth_50,
                                     },
                                     features=feats,
                                     region_name=REGION,

@@ -20,8 +20,16 @@ class Tick:
     volume: float = 0.0
     best_bid: float | None = None
     best_ask: float | None = None
-    bid_depth_top10: float | None = None  # summed size, top 10 bid levels
+    bid_depth_top10: float | None = None  # summed size, top 10 bid levels (kept for schema compat)
     ask_depth_top10: float | None = None  # summed size, top 10 ask levels
+    # Additional depth tiers -- lets features distinguish "wall right at the
+    # touch" from "wall sitting 30 levels back", which top-10-only can't.
+    bid_depth_5: float | None = None
+    ask_depth_5: float | None = None
+    bid_depth_20: float | None = None
+    ask_depth_20: float | None = None
+    bid_depth_50: float | None = None
+    ask_depth_50: float | None = None
 
 
 @dataclass
@@ -83,10 +91,58 @@ def book_imbalance(tick: Tick) -> float | None:
     return (tick.bid_depth_top10 - tick.ask_depth_top10) / total
 
 
+def tier_imbalance(tick: Tick, tier: int) -> float | None:
+    """Same imbalance formula as book_imbalance, but at a specific depth
+    tier (5, 20, or 50). Comparing imbalance ACROSS tiers can reveal
+    structure a single-depth view can't: e.g. strong buy pressure right at
+    the touch (tier 5) but heavy resting size far below on the ask side
+    (tier 50) implies a very different situation than uniform imbalance
+    across all tiers."""
+    bid = getattr(tick, f"bid_depth_{tier}", None)
+    ask = getattr(tick, f"ask_depth_{tier}", None)
+    if bid is None or ask is None:
+        return None
+    total = bid + ask
+    if total == 0:
+        return 0.0
+    return (bid - ask) / total
+
+
 def spread(tick: Tick) -> float | None:
     if tick.best_bid is None or tick.best_ask is None:
         return None
     return tick.best_ask - tick.best_bid
+
+
+def spread_change_rate(buf: RollingBuffer, now_ts: float, seconds: float = 10.0) -> float | None:
+    """Rate of change of the bid-ask spread over the trailing window.
+    Widening spreads are a classic market-microstructure precursor signal
+    -- market makers often pull back / widen quotes ahead of anticipated
+    volatility, so a widening spread can foreshadow a bigger move before
+    the price itself has moved much."""
+    recent = buf.since(seconds, now_ts)
+    spreads = [spread(t) for t in recent]
+    spreads = [s for s in spreads if s is not None]
+    if len(spreads) < 2 or spreads[0] == 0:
+        return None
+    return (spreads[-1] - spreads[0]) / spreads[0]
+
+
+def spread_zscore(buf: RollingBuffer, now_ts: float, lookback_seconds: float = 60.0) -> float | None:
+    """How unusual the CURRENT spread is relative to its own recent
+    distribution -- a spread that's 3 standard deviations wider than
+    normal is a stronger signal than one that's simply 'wide' in absolute
+    terms, which varies naturally with the price level."""
+    recent = buf.since(lookback_seconds, now_ts)
+    spreads = [spread(t) for t in recent]
+    spreads = [s for s in spreads if s is not None]
+    if len(spreads) < 5:
+        return None
+    arr = np.array(spreads, dtype=float)
+    std = arr.std()
+    if std == 0:
+        return 0.0
+    return float((arr[-1] - arr.mean()) / std)
 
 
 def depth_thinning_rate(buf: RollingBuffer, now_ts: float, seconds: float = 10.0) -> float | None:
@@ -110,6 +166,74 @@ def distance_to_strike_in_stdevs(current_price: float, strike_price: float, vol_
         return None
     log_dist = np.log(current_price / strike_price)
     return log_dist / vol_1s
+
+
+def local_extrema_count(ticks: list[Tick]) -> int | None:
+    """Number of local peaks/troughs (direction changes) in the price path.
+    A rough, unbiased stand-in for 'choppiness' or pattern complexity --
+    doesn't try to name a specific chart pattern (head-and-shoulders, etc.),
+    just counts how many times the price direction reversed. Choppy/complex
+    paths have more; smooth trends have fewer."""
+    if len(ticks) < 3:
+        return None
+    prices = np.array([t.price for t in ticks], dtype=float)
+    diffs = np.diff(prices)
+    signs = np.sign(diffs)
+    signs = signs[signs != 0]  # ignore flat/no-change steps
+    if len(signs) < 2:
+        return 0
+    direction_changes = np.sum(signs[1:] != signs[:-1])
+    return int(direction_changes)
+
+
+def path_curvature(ticks: list[Tick]) -> float | None:
+    """Mean absolute second difference of price, normalized by price level.
+    High curvature = price path is bending/whipsawing a lot; low curvature
+    = smooth, straight-line-like movement (trend-like)."""
+    if len(ticks) < 3:
+        return None
+    prices = np.array([t.price for t in ticks], dtype=float)
+    if prices[0] == 0:
+        return None
+    second_diffs = np.diff(prices, n=2)
+    return float(np.mean(np.abs(second_diffs)) / prices[0])
+
+
+def ma_cross_count(ticks: list[Tick], ma_window: int = 5) -> int | None:
+    """Number of times price crosses its own trailing moving average --
+    a simple proxy for 'is price oscillating around a level' (more crosses)
+    vs 'is price trending away from it' (fewer crosses)."""
+    if len(ticks) < ma_window + 2:
+        return None
+    prices = np.array([t.price for t in ticks], dtype=float)
+    ma = np.convolve(prices, np.ones(ma_window) / ma_window, mode="valid")
+    aligned_prices = prices[ma_window - 1:]
+    above = aligned_prices > ma
+    if len(above) < 2:
+        return 0
+    crosses = np.sum(above[1:] != above[:-1])
+    return int(crosses)
+
+
+def recent_range_ratio(buf: RollingBuffer, now_ts: float, recent_seconds: float = 15.0, prior_seconds: float = 30.0) -> float | None:
+    """Ratio of (high-low range in the most recent window) to (high-low
+    range in the prior window before that). >1 means volatility/range is
+    expanding right now relative to just before; <1 means contracting."""
+    recent = buf.since(recent_seconds, now_ts)
+    prior_cutoff_ticks = buf.since(prior_seconds, now_ts)
+    prior = [t for t in prior_cutoff_ticks if t not in recent]
+
+    if len(recent) < 2 or len(prior) < 2:
+        return None
+
+    recent_prices = [t.price for t in recent]
+    prior_prices = [t.price for t in prior]
+    recent_range = max(recent_prices) - min(recent_prices)
+    prior_range = max(prior_prices) - min(prior_prices)
+
+    if prior_range == 0:
+        return None
+    return recent_range / prior_range
 
 
 def compute_feature_snapshot(buf: RollingBuffer, strike_price: float, now_ts: float | None = None) -> dict:
@@ -143,5 +267,14 @@ def compute_feature_snapshot(buf: RollingBuffer, strike_price: float, now_ts: fl
         "depth_thinning_10s": depth_thinning_rate(buf, now_ts, 10.0),
         "distance_to_strike_stdevs": distance_to_strike_in_stdevs(last.price, strike_price, vol_15s),
         "log_return_from_strike": float(np.log(last.price / strike_price)) if strike_price else None,
+        "local_extrema_60s": local_extrema_count(win_60s),
+        "path_curvature_60s": path_curvature(win_60s),
+        "ma_cross_count_60s": ma_cross_count(win_60s, ma_window=5),
+        "recent_range_ratio": recent_range_ratio(buf, now_ts, 15.0, 30.0),
+        "imbalance_5": tier_imbalance(last, 5),
+        "imbalance_20": tier_imbalance(last, 20),
+        "imbalance_50": tier_imbalance(last, 50),
+        "spread_change_rate_10s": spread_change_rate(buf, now_ts, 10.0),
+        "spread_zscore_60s": spread_zscore(buf, now_ts, 60.0),
     }
     return feat

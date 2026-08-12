@@ -54,14 +54,23 @@ class OrderBook:
     def best_ask(self) -> float | None:
         return min(self.asks) if self.asks else None
 
-    def top10_bid_depth(self) -> float | None:
+    def bid_depth(self, n: int) -> float | None:
+        """Summed size of the top n bid price levels (n can be any depth --
+        the full book is already held in memory regardless)."""
         if not self.bids:
             return None
-        top_prices = sorted(self.bids, reverse=True)[:10]
+        top_prices = sorted(self.bids, reverse=True)[:n]
         return sum(self.bids[p] for p in top_prices)
 
-    def top10_ask_depth(self) -> float | None:
+    def ask_depth(self, n: int) -> float | None:
+        """Summed size of the top n ask price levels."""
         if not self.asks:
             return None
-        top_prices = sorted(self.asks)[:10]
+        top_prices = sorted(self.asks)[:n]
         return sum(self.asks[p] for p in top_prices)
+
+    def top10_bid_depth(self) -> float | None:
+        return self.bid_depth(10)
+
+    def top10_ask_depth(self) -> float | None:
+        return self.ask_depth(10)
