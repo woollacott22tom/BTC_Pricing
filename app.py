@@ -316,23 +316,31 @@ async def cryptocom_feed_loop():
             backoff = min(backoff * 2, 30.0)
 
 
+def _fetch_kalshi_market() -> dict | None:
+    """Synchronous, blocking call -- run via loop.run_in_executor so it
+    never freezes the shared asyncio event loop that Coinbase, Kraken, and
+    Crypto.com's WebSocket feeds also depend on."""
+    resp = requests.get(
+        f"{KALSHI_BASE_URL}/markets",
+        params={"series_ticker": KALSHI_SERIES_TICKER, "status": "open", "limit": 5},
+        timeout=5,
+    )
+    resp.raise_for_status()
+    markets = resp.json().get("markets", [])
+    return markets[0] if markets else None
+
+
 async def kalshi_poll_loop():
     """Polls Kalshi's public REST API for the currently open KXBTC15M
     market's floor_strike (the real settlement threshold/"Target" in their
     UI) -- this is a much lighter-weight poll than the full kalshi_poller.py
     service, since the dashboard only needs the strike + current bid/ask,
     not a full historical price log."""
+    loop = asyncio.get_event_loop()
     while True:
         try:
-            resp = requests.get(
-                f"{KALSHI_BASE_URL}/markets",
-                params={"series_ticker": KALSHI_SERIES_TICKER, "status": "open", "limit": 5},
-                timeout=5,
-            )
-            resp.raise_for_status()
-            markets = resp.json().get("markets", [])
-            if markets:
-                m = markets[0]
+            m = await loop.run_in_executor(None, _fetch_kalshi_market)
+            if m:
                 strike = m.get("floor_strike")
                 yes_bid = m.get("yes_bid_dollars")
                 yes_ask = m.get("yes_ask_dollars")
