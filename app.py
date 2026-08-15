@@ -34,6 +34,7 @@ from compute import Tick, RollingBuffer, compute_feature_snapshot
 from order_book import OrderBook
 from jwt_auth import build_ws_jwt
 from kraken_order_book import KrakenOrderBook
+from crypto_order_book import CryptoComOrderBook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("serving")
@@ -54,6 +55,30 @@ def _kraken_subscribe_msg(channel: str) -> dict:
     return {"method": "subscribe", "params": {"channel": channel, "symbol": [KRAKEN_SYMBOL]}}
 
 
+CRYPTOCOM_WS = "wss://stream.crypto.com/exchange/v1/market"
+CRYPTOCOM_INSTRUMENT = "BTC_USD"
+CRYPTOCOM_BOOK_DEPTH = 50
+
+
+def _cryptocom_subscribe_msg() -> dict:
+    return {
+        "id": 1,
+        "method": "subscribe",
+        "params": {"channels": [f"book.{CRYPTOCOM_INSTRUMENT}.{CRYPTOCOM_BOOK_DEPTH}", f"trade.{CRYPTOCOM_INSTRUMENT}"]},
+    }
+
+
+def _cryptocom_try_parse_trade(entry: dict) -> tuple[float, float] | None:
+    try:
+        price = entry.get("p", entry.get("price"))
+        qty = entry.get("q", entry.get("quantity", entry.get("qty")))
+        if price is None or qty is None:
+            return None
+        return float(price), float(qty)
+    except (TypeError, ValueError):
+        return None
+
+
 app = FastAPI(title="BTC 15-min Predictor")
 app.add_middleware(
     CORSMiddleware,
@@ -71,6 +96,12 @@ STATE = {
 }
 
 KRAKEN_STATE = {
+    "buf": RollingBuffer(max_seconds=900),
+    "window_id": None,
+    "strike_price": None,
+}
+
+CRYPTOCOM_STATE = {
     "buf": RollingBuffer(max_seconds=900),
     "window_id": None,
     "strike_price": None,
@@ -226,6 +257,66 @@ async def kraken_feed_loop():
             backoff = min(backoff * 2, 30.0)
 
 
+async def cryptocom_feed_loop():
+    """Same pattern as feed_loop()/kraken_feed_loop() -- fully independent
+    state, so this being unverified/experimental can't affect Coinbase or
+    Kraken. See crypto_ingestion.py's module docstring for the honest
+    caveat about this integration's confidence level."""
+    backoff = 1.0
+    while True:
+        try:
+            async with websockets.connect(CRYPTOCOM_WS, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+                backoff = 1.0
+                await asyncio.sleep(1.0)
+                await ws.send(json.dumps(_cryptocom_subscribe_msg()))
+                book = CryptoComOrderBook()
+
+                async for raw in ws:
+                    msg = json.loads(raw)
+
+                    if msg.get("method") == "public/heartbeat":
+                        await ws.send(json.dumps({"id": msg.get("id"), "method": "public/respond-heartbeat"}))
+                        continue
+
+                    result = msg.get("result", {})
+                    channel = result.get("channel") or msg.get("channel")
+                    now = datetime.now(timezone.utc)
+                    now_ts = now.timestamp()
+
+                    if channel == "book":
+                        for entry in result.get("data", []):
+                            is_snapshot = not book.ready
+                            book.apply_message(entry, is_snapshot=is_snapshot)
+
+                    elif channel == "trade":
+                        for entry in result.get("data", []):
+                            parsed = _cryptocom_try_parse_trade(entry)
+                            if parsed is None:
+                                continue
+                            price, volume = parsed
+
+                            tick = Tick(
+                                ts=now_ts, price=price, volume=volume,
+                                best_bid=book.best_bid(), best_ask=book.best_ask(),
+                                bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
+                                bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                                bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                                bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
+                            )
+                            CRYPTOCOM_STATE["buf"].add(tick)
+
+                            wid = window_id_for(now)
+                            if CRYPTOCOM_STATE["window_id"] != wid:
+                                CRYPTOCOM_STATE["window_id"] = wid
+                                CRYPTOCOM_STATE["strike_price"] = price
+                                log.info(f"[serving/cryptocom] window rolled: {wid} strike={price}")
+
+        except Exception as e:
+            log.error(f"[serving/cryptocom] feed error: {e}, retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
 async def kalshi_poll_loop():
     """Polls Kalshi's public REST API for the currently open KXBTC15M
     market's floor_strike (the real settlement threshold/"Target" in their
@@ -266,6 +357,7 @@ async def startup():
     asyncio.create_task(feed_loop())
     asyncio.create_task(kraken_feed_loop())
     asyncio.create_task(kalshi_poll_loop())
+    asyncio.create_task(cryptocom_feed_loop())
 
 
 @app.get("/health")
@@ -298,6 +390,7 @@ def live():
         "kalshi_ticker": KALSHI_STATE["ticker"],
         "kalshi_yes_bid_cents": KALSHI_STATE["yes_bid_cents"],
         "kalshi_yes_ask_cents": KALSHI_STATE["yes_ask_cents"],
+        "cryptocom": None,
     }
 
     kraken_buf = KRAKEN_STATE["buf"]
@@ -308,6 +401,16 @@ def live():
             "strike_price": KRAKEN_STATE["strike_price"],
             "current_price": kraken_feats.get("price"),
             "features": kraken_feats,
+        }
+
+    cryptocom_buf = CRYPTOCOM_STATE["buf"]
+    if cryptocom_buf.ticks and CRYPTOCOM_STATE["strike_price"] is not None:
+        cryptocom_feats = compute_feature_snapshot(cryptocom_buf, CRYPTOCOM_STATE["strike_price"], now_ts)
+        result["cryptocom"] = {
+            "window_id": CRYPTOCOM_STATE["window_id"],
+            "strike_price": CRYPTOCOM_STATE["strike_price"],
+            "current_price": cryptocom_feats.get("price"),
+            "features": cryptocom_feats,
         }
 
     cols = STATE["feature_cols"]
