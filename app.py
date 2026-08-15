@@ -285,8 +285,7 @@ async def cryptocom_feed_loop():
 
                     if channel == "book":
                         for entry in result.get("data", []):
-                            is_snapshot = not book.ready
-                            book.apply_message(entry, is_snapshot=is_snapshot)
+                            book.apply_message(entry, is_snapshot=True)
 
                     elif channel == "trade":
                         for entry in result.get("data", []):

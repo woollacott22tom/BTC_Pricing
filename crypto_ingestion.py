@@ -112,8 +112,10 @@ async def run():
 
                     if channel == "book":
                         for entry in result.get("data", []):
-                            is_snapshot = not book.ready
-                            book.apply_message(entry, is_snapshot=is_snapshot)
+                            # Crypto.com sends a FULL replacement snapshot on
+                            # every push (confirmed from live data), not
+                            # incremental deltas -- always clear + repopulate
+                            book.apply_message(entry, is_snapshot=True)
 
                     elif channel == "trade":
                         for entry in result.get("data", []):

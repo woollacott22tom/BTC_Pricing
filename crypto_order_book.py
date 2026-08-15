@@ -47,7 +47,15 @@ class CryptoComOrderBook:
         self.asks: dict[float, float] = {}
         self.ready = False
 
-    def apply_message(self, data_entry: dict, is_snapshot: bool):
+    def apply_message(self, data_entry: dict, is_snapshot: bool = True):
+        """IMPORTANT: Crypto.com's book channel, confirmed from live data,
+        pushes a FULL replacement snapshot roughly every 500ms -- NOT
+        sparse incremental deltas like Coinbase/Kraken. is_snapshot
+        defaults to True and should stay True on every call; treating
+        pushes as incremental merges (the original design here) would
+        let stale price levels accumulate forever, since a level that
+        silently disappears between snapshots never gets an explicit
+        qty=0 to signal its removal."""
         bids_raw = data_entry.get("bids", [])
         asks_raw = data_entry.get("asks", [])
 
