@@ -51,8 +51,16 @@ def _subscribe_msg(channel: str) -> dict:
     return {"type": "subscribe", "product_ids": [PRODUCT_ID], "channel": channel, "jwt": build_ws_jwt()}
 
 
+KRAKEN_BOOK_DEPTH = 100  # same fix as kraken_ingestion.py -- was unset, likely
+                          # defaulted to a shallow depth that silently capped
+                          # imbalance_20/imbalance_50
+
+
 def _kraken_subscribe_msg(channel: str) -> dict:
-    return {"method": "subscribe", "params": {"channel": channel, "symbol": [KRAKEN_SYMBOL]}}
+    params = {"channel": channel, "symbol": [KRAKEN_SYMBOL]}
+    if channel == "book":
+        params["depth"] = KRAKEN_BOOK_DEPTH
+    return {"method": "subscribe", "params": params}
 
 
 CRYPTOCOM_WS = "wss://stream.crypto.com/exchange/v1/market"

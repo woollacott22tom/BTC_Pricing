@@ -49,8 +49,17 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 TICK_LOG_INTERVAL_SEC = 1.0
 
 
+KRAKEN_BOOK_DEPTH = 100  # explicit depth request -- was previously unset,
+                          # which likely defaulted to a shallow depth
+                          # (commonly 10), silently capping imbalance_20
+                          # and imbalance_50 to the same shallow view
+
+
 def _subscribe_msg(channel: str) -> dict:
-    return {"method": "subscribe", "params": {"channel": channel, "symbol": [SYMBOL]}}
+    params = {"channel": channel, "symbol": [SYMBOL]}
+    if channel == "book":
+        params["depth"] = KRAKEN_BOOK_DEPTH
+    return {"method": "subscribe", "params": params}
 
 
 async def run():
@@ -58,6 +67,12 @@ async def run():
     strike_price: float | None = None
     current_window_id: str | None = None
     last_logged = 0.0
+
+    # Same trade-flow diagnostic added to crypto_ingestion.py, for a fair
+    # apples-to-apples comparison of actual trade frequency between feeds.
+    trade_message_count = 0
+    trade_entry_count = 0
+    last_diag_log = time.time()
 
     backoff = 1.0
     while True:
@@ -74,6 +89,13 @@ async def run():
                     if msg_count <= 5:
                         log.info(f"Raw message #{msg_count}: {raw[:300]}")
 
+                    if time.time() - last_diag_log >= 30.0:
+                        log.info(f"[trade-flow diagnostic] {trade_message_count} trade messages, "
+                                 f"{trade_entry_count} individual trade entries in the last 30s")
+                        trade_message_count = 0
+                        trade_entry_count = 0
+                        last_diag_log = time.time()
+
                     msg = json.loads(raw)
                     channel = msg.get("channel")
                     now = datetime.now(timezone.utc)
@@ -85,7 +107,9 @@ async def run():
                             book.apply_message(msg_type, entry)
 
                     elif channel == "trade":
+                        trade_message_count += 1
                         for entry in msg.get("data", []):
+                            trade_entry_count += 1
                             try:
                                 price = float(entry["price"])
                                 volume = float(entry["qty"])
