@@ -84,6 +84,14 @@ async def run():
     current_window_id: str | None = None
     last_logged = 0.0
 
+    # Ongoing trade-flow diagnostic -- the initial raw-message debug
+    # logging (first 10 messages) gets exhausted by book-channel traffic
+    # within seconds, giving no visibility into trade frequency after
+    # that. This reports actual trade throughput every 30s regardless.
+    trade_message_count = 0
+    trade_entry_count = 0
+    last_diag_log = time.time()
+
     backoff = 1.0
     while True:
         try:
@@ -98,6 +106,13 @@ async def run():
                     msg_count += 1
                     if msg_count <= 10:
                         log.info(f"Raw message #{msg_count}: {raw[:400]}")
+
+                    if time.time() - last_diag_log >= 30.0:
+                        log.info(f"[trade-flow diagnostic] {trade_message_count} trade messages, "
+                                 f"{trade_entry_count} individual trade entries in the last 30s")
+                        trade_message_count = 0
+                        trade_entry_count = 0
+                        last_diag_log = time.time()
 
                     msg = json.loads(raw)
 
@@ -118,9 +133,12 @@ async def run():
                             book.apply_message(entry, is_snapshot=True)
 
                     elif channel == "trade":
+                        trade_message_count += 1
                         for entry in result.get("data", []):
+                            trade_entry_count += 1
                             parsed = _try_parse_trade(entry)
                             if parsed is None:
+                                log.warning(f"Trade entry failed to parse -- unrecognized shape: {entry}")
                                 continue
                             price, volume = parsed
 
