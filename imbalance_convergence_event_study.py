@@ -294,6 +294,9 @@ def main():
             tag = "CONTINUATION setup" if aligned else ("REVERSAL setup" if trend != "kalshi_flat" and trend != "unknown" else "no prior trend")
             print(f"    dir={dir_label}  trend={trend:16s}  n={len(arr):4d}  "
                   f"mean_change={arr.mean():+.4f}cents  [{tag}]")
+            if trend in ("kalshi_uptrend", "kalshi_downtrend") and abs(arr.mean()) < 1e-9:
+                sample = changes[:8]
+                print(f"      DIAGNOSTIC (mean suspiciously exactly zero) -- raw sample: {sample}")
     print()
 
     print("Caveat: small n per direction means these means can be noisy -- treat this as a first")
