@@ -41,13 +41,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("lead_lag")
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-TICKS_TABLE = "btc_ticks"
+EXCHANGE_TABLES = {"coinbase": "btc_ticks", "kraken": "kraken_ticks", "cryptocom": "cryptocom_ticks"}
 KALSHI_TABLE = "kalshi_prices"
 
 
-def get_kalshi_window_ids(region: str = REGION) -> list[str]:
+def get_kalshi_window_ids(region: str = REGION, recent_windows: int | None = None) -> list[str]:
     """kalshi_prices is small (one process, a few weeks max) -- safe to
-    scan for distinct window_ids rather than needing a GSI."""
+    scan for distinct window_ids rather than needing a GSI.
+
+    If recent_windows is set, returns only the N most recent (by window_id,
+    which sorts chronologically since it's an ISO timestamp) -- lets you
+    test 'right now' behavior specifically, rather than always pooling the
+    full history, which would average away a lead-lag relationship that's
+    genuinely shifted over the course of a day."""
     dynamodb = boto3.resource("dynamodb", region_name=region)
     table = dynamodb.Table(KALSHI_TABLE)
     window_ids = set()
@@ -59,7 +65,10 @@ def get_kalshi_window_ids(region: str = REGION) -> list[str]:
         if "LastEvaluatedKey" not in resp:
             break
         scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-    return sorted(window_ids)
+    sorted_ids = sorted(window_ids)
+    if recent_windows is not None:
+        return sorted_ids[-recent_windows:]
+    return sorted_ids
 
 
 def get_window_series(table_name: str, window_id: str, region: str = REGION) -> list[dict]:
@@ -77,16 +86,16 @@ def get_window_series(table_name: str, window_id: str, region: str = REGION) -> 
     return sorted(items, key=lambda x: float(x["timestamp"]))
 
 
-def build_aligned_returns(coinbase_items: list[dict], kalshi_items: list[dict]) -> pd.DataFrame | None:
-    """Returns a DataFrame with columns [timestamp, coinbase_return,
+def build_aligned_returns(exchange_items: list[dict], kalshi_items: list[dict]) -> pd.DataFrame | None:
+    """Returns a DataFrame with columns [timestamp, exchange_return,
     kalshi_return] aligned via as-of merge, or None if either side is too
     sparse to be useful."""
-    if len(coinbase_items) < 5 or len(kalshi_items) < 5:
+    if len(exchange_items) < 5 or len(kalshi_items) < 5:
         return None
 
-    cb_df = pd.DataFrame({
-        "timestamp": [float(t["timestamp"]) for t in coinbase_items],
-        "price": [float(t["price"]) for t in coinbase_items],
+    ex_df = pd.DataFrame({
+        "timestamp": [float(t["timestamp"]) for t in exchange_items],
+        "price": [float(t["price"]) for t in exchange_items],
     }).sort_values("timestamp")
 
     kl_df = pd.DataFrame({
@@ -95,31 +104,31 @@ def build_aligned_returns(coinbase_items: list[dict], kalshi_items: list[dict]) 
     }).sort_values("timestamp")
 
     merged = pd.merge_asof(
-        kl_df, cb_df, on="timestamp", direction="backward", tolerance=10.0
+        kl_df, ex_df, on="timestamp", direction="backward", tolerance=10.0
     )
     merged = merged.dropna(subset=["price", "yes_mid_cents"])
     if len(merged) < 5:
         return None
 
-    merged["coinbase_return"] = np.log(merged["price"]).diff()
+    merged["exchange_return"] = np.log(merged["price"]).diff()
     merged["kalshi_return"] = merged["yes_mid_cents"].diff() / 100.0  # keep units comparable-ish (small deltas)
-    merged = merged.dropna(subset=["coinbase_return", "kalshi_return"])
+    merged = merged.dropna(subset=["exchange_return", "kalshi_return"])
 
-    return merged[["timestamp", "coinbase_return", "kalshi_return"]]
+    return merged[["timestamp", "exchange_return", "kalshi_return"]]
 
 
 def correlation_at_lags(df: pd.DataFrame, max_lag_steps: int) -> dict[int, float]:
-    """Positive lag_steps: coinbase_return(t) correlated against
-    kalshi_return(t + lag_steps) -- i.e. does coinbase's move predict
+    """Positive lag_steps: exchange_return(t) correlated against
+    kalshi_return(t + lag_steps) -- i.e. does the exchange's move predict
     kalshi's move `lag_steps` observations later."""
     results = {}
     n = len(df)
     for lag in range(-max_lag_steps, max_lag_steps + 1):
         if lag >= 0:
-            a = df["coinbase_return"].iloc[: n - lag].reset_index(drop=True)
+            a = df["exchange_return"].iloc[: n - lag].reset_index(drop=True)
             b = df["kalshi_return"].iloc[lag:].reset_index(drop=True)
         else:
-            a = df["coinbase_return"].iloc[-lag:].reset_index(drop=True)
+            a = df["exchange_return"].iloc[-lag:].reset_index(drop=True)
             b = df["kalshi_return"].iloc[: n + lag].reset_index(drop=True)
 
         if len(a) < 5 or a.std() == 0 or b.std() == 0:
@@ -130,16 +139,24 @@ def correlation_at_lags(df: pd.DataFrame, max_lag_steps: int) -> dict[int, float
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--exchange", type=str, default="coinbase", choices=list(EXCHANGE_TABLES.keys()))
     parser.add_argument("--max-lag-seconds", type=int, default=20)
     parser.add_argument("--poll-interval", type=float, default=2.0,
                          help="Kalshi poll interval in seconds -- sets the lag step size")
+    parser.add_argument("--recent-windows", type=int, default=None,
+                         help="Only use the N most recent windows (e.g. 12 for the last ~3 hours) "
+                              "instead of the full history -- lead-lag relationships can shift over "
+                              "the course of a day, and pooling everything averages that away.")
     parser.add_argument("--region", type=str, default=REGION)
     args = parser.parse_args()
 
+    exchange_table = EXCHANGE_TABLES[args.exchange]
     max_lag_steps = int(args.max_lag_seconds / args.poll_interval)
 
-    window_ids = get_kalshi_window_ids(region=args.region)
-    log.info(f"Found {len(window_ids)} windows with Kalshi data")
+    window_ids = get_kalshi_window_ids(region=args.region, recent_windows=args.recent_windows)
+    scope_note = f"most recent {args.recent_windows}" if args.recent_windows else "all"
+    log.info(f"Found {len(window_ids)} windows with Kalshi data ({scope_note} in scope), "
+             f"testing against {args.exchange}")
 
     if len(window_ids) == 0:
         log.warning("No Kalshi data found yet. Let the poller run longer before analyzing.")
@@ -149,10 +166,10 @@ def main():
     windows_used = 0
 
     for wid in window_ids:
-        coinbase_items = get_window_series(TICKS_TABLE, wid, region=args.region)
+        exchange_items = get_window_series(exchange_table, wid, region=args.region)
         kalshi_items = get_window_series(KALSHI_TABLE, wid, region=args.region)
 
-        aligned = build_aligned_returns(coinbase_items, kalshi_items)
+        aligned = build_aligned_returns(exchange_items, kalshi_items)
         if aligned is None:
             continue
 
@@ -167,16 +184,16 @@ def main():
     log.info(f"Used {windows_used} windows with sufficient overlapping data")
 
     if windows_used == 0:
-        log.warning("No windows had enough overlapping Coinbase + Kalshi data to analyze. "
-                     "Let both pollers run longer.")
+        log.warning(f"No windows had enough overlapping {args.exchange} + Kalshi data to analyze. "
+                     "Let both pollers run longer, or reduce --recent-windows.")
         sys.exit(0)
 
     avg_corr_by_lag = {
         lag: float(np.mean(corrs)) for lag, corrs in all_lag_correlations.items() if corrs
     }
 
-    print("\nLag (seconds) -> average correlation across windows:")
-    print("(positive lag = Coinbase move precedes Kalshi move by that many seconds)")
+    print(f"\n[{args.exchange}] Lag (seconds) -> average correlation across {windows_used} windows ({scope_note}):")
+    print(f"(positive lag = {args.exchange}'s move precedes Kalshi's move by that many seconds)")
     for lag_steps in sorted(avg_corr_by_lag.keys()):
         lag_seconds = lag_steps * args.poll_interval
         bar = "#" * int(abs(avg_corr_by_lag[lag_steps]) * 50)
@@ -188,10 +205,10 @@ def main():
 
     print(f"\nStrongest correlation at lag = {best_lag_seconds:+.1f}s (correlation = {best_corr:+.4f})")
     if best_lag_steps > 0:
-        print(f"Interpretation: Coinbase price moves appear to precede Kalshi's price "
+        print(f"Interpretation: {args.exchange}'s price moves appear to precede Kalshi's price "
               f"by roughly {best_lag_seconds:.1f} seconds, on average across {windows_used} windows.")
     elif best_lag_steps < 0:
-        print(f"Interpretation: Kalshi's price appears to move BEFORE Coinbase's, by roughly "
+        print(f"Interpretation: Kalshi's price appears to move BEFORE {args.exchange}'s, by roughly "
               f"{abs(best_lag_seconds):.1f} seconds -- opposite of the front-running hypothesis.")
     else:
         print("Interpretation: no meaningful lead/lag detected -- prices move together with no offset.")
