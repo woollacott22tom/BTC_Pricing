@@ -101,6 +101,15 @@ FEATURE_COLS = FEATURE_COLS + CONSENSUS_FEATURE_COLS
 KALSHI_MOMENTUM_LOOKBACKS = {"kalshi_momentum_15s": 15.0, "kalshi_momentum_60s": 60.0}
 FEATURE_COLS = FEATURE_COLS + list(KALSHI_MOMENTUM_LOOKBACKS.keys())
 FEATURE_COLS = FEATURE_COLS + ["hour_of_day_utc", "day_of_week"]
+
+# Reversal label config: "is Kalshi's price about to reverse against its
+# current trend, at ANY point in the window" -- not the old settlement-
+# specific flip concept (window-level, final-60s-only). This is the same
+# underlying question asked continuously throughout the window, usable for
+# both entry (imminent trend forming) and exit (imminent trend breaking)
+# decisions. See train_reversal_model() and compute_reversal_labels().
+REVERSAL_HORIZON_SEC = 45.0  # matches the horizon validated against Kalshi's 15s API cache
+REVERSAL_THRESHOLD_CENTS = 3.0  # minimum forward move to count as a genuine reversal, not noise
 KALSHI_MERGE_TOLERANCE_SEC = 20.0  # Kalshi's own API caches responses for 15s server-side
                                      # (confirmed via kalshi_polling_diagnostic.py) -- a tick
                                      # older than that is genuinely stale, not just missing
@@ -169,6 +178,79 @@ def _kalshi_ticks_to_momentum_df(kalshi_ticks: list[dict]) -> pd.DataFrame | Non
     return df[["timestamp"] + list(KALSHI_MOMENTUM_LOOKBACKS.keys())]
 
 
+def _kalshi_ticks_to_price_df(kalshi_ticks: list[dict]) -> pd.DataFrame | None:
+    """Raw Kalshi price series (NOT momentum) -- used only for computing
+    the forward-looking reversal LABEL. Labels are allowed to look into
+    the future (that's what makes them a trainable target); this must
+    stay completely separate from the momentum FEATURE computation above,
+    which must never see the future."""
+    if not kalshi_ticks:
+        return None
+    rows = []
+    for t in kalshi_ticks:
+        if "yes_mid_cents" not in t or t["yes_mid_cents"] is None:
+            continue
+        rows.append({"timestamp": float(t["timestamp"]), "yes_mid_cents": float(t["yes_mid_cents"])})
+    if len(rows) < 2:
+        return None
+    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+
+
+def compute_reversal_labels(grid_df: pd.DataFrame, kalshi_price_df: pd.DataFrame | None,
+                             horizon_seconds: float = REVERSAL_HORIZON_SEC,
+                             threshold_cents: float = REVERSAL_THRESHOLD_CENTS,
+                             tolerance_seconds: float = KALSHI_MERGE_TOLERANCE_SEC) -> pd.Series:
+    """For each row in grid_df (must already have 'timestamp' and
+    'kalshi_momentum_15s' columns), determines whether Kalshi's price
+    REVERSES against its current trailing direction within the next
+    horizon_seconds, by at least threshold_cents.
+
+      1 = genuine reversal (price moved the OPPOSITE way from the current
+          trend, by more than the noise threshold)
+      0 = no reversal (price continued the same direction, or moved by
+          less than the threshold either way)
+      NaN = excluded -- either there's no clear existing trend to reverse
+          FROM (momentum ~0), or forward data isn't available within
+          tolerance (e.g. near the very end of the window)
+
+    Uses the SAME vectorized merge_asof technique as everything else here,
+    just with a FORWARD-looking target this time -- fine for a label,
+    which is explicitly the case for a supervised training TARGET, as
+    opposed to a feature (which must never see the future)."""
+    n = len(grid_df)
+    if kalshi_price_df is None or "kalshi_momentum_15s" not in grid_df.columns:
+        return pd.Series([np.nan] * n, index=grid_df.index)
+
+    baseline_df = pd.merge_asof(
+        grid_df[["timestamp"]], kalshi_price_df, on="timestamp", direction="backward",
+        tolerance=tolerance_seconds,
+    )
+    baseline_price = baseline_df["yes_mid_cents"].reset_index(drop=True)
+
+    target_lookup = grid_df[["timestamp"]].copy()
+    target_lookup["target_ts"] = target_lookup["timestamp"] + horizon_seconds
+    target_lookup = target_lookup.sort_values("target_ts")
+    target_df = pd.merge_asof(
+        target_lookup.rename(columns={"timestamp": "orig_ts", "target_ts": "timestamp"}),
+        kalshi_price_df, on="timestamp", direction="backward", tolerance=tolerance_seconds,
+    )
+    target_df = target_df.sort_values("orig_ts").reset_index(drop=True)
+    target_price = target_df["yes_mid_cents"]
+
+    forward_change = target_price - baseline_price
+    current_direction = np.sign(grid_df["kalshi_momentum_15s"].reset_index(drop=True))
+
+    label = pd.Series([np.nan] * n)
+    valid = forward_change.notna() & current_direction.notna() & (current_direction != 0)
+    reversed_mask = valid & (np.sign(forward_change) != current_direction) & (forward_change.abs() >= threshold_cents)
+    not_reversed_mask = valid & ~reversed_mask
+
+    label[reversed_mask.to_numpy()] = 1
+    label[not_reversed_mask.to_numpy()] = 0
+    label.index = grid_df.index
+    return label
+
+
 def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool, region: str = REGION) -> pd.DataFrame | None:
     cb_ticks = get_generic_window_ticks("btc_ticks", window_id, region)
     cb_df = _ticks_to_feature_df(cb_ticks, "cb")
@@ -199,9 +281,16 @@ def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool,
 
     merged["window_id"] = window_id
     merged["label_up"] = outcome_up
-    merged["label_flip"] = int(flip_occurred)
+    merged["label_flip"] = int(flip_occurred)  # legacy: settlement-specific flip, window-level only
     cb_seconds_remaining = {float(t["timestamp"]): float(t.get("feat_seconds_remaining", -1)) for t in cb_ticks}
     merged["seconds_remaining"] = merged["timestamp"].map(cb_seconds_remaining)
+
+    # General-purpose "is a reversal imminent right now" label -- usable at
+    # ANY point in the window, not just the settlement tail. This is what
+    # actually serves both entering on an expected trend AND exiting
+    # before an expected flip, since it's the same underlying question.
+    kalshi_price_df = _kalshi_ticks_to_price_df(kalshi_ticks)
+    merged["label_reversal"] = compute_reversal_labels(merged, kalshi_price_df)
 
     # Raw time-of-day/day-of-week -- NOT assuming which hours are "high
     # volatility"/"institutional" a priori. Letting the model (and separate
@@ -341,13 +430,25 @@ def train_directional_model(df: pd.DataFrame):
     }
 
 
-def train_flip_model(df: pd.DataFrame):
-    df = df[df["seconds_remaining"] <= 90]
+def train_reversal_model(df: pd.DataFrame):
+    """Replaces the old settlement-only flip model. Trained on ALL rows
+    across the entire window (no seconds_remaining filter), predicting
+    whether Kalshi's price is about to reverse against its CURRENT
+    trailing direction -- usable continuously throughout the window, for
+    both entering on an expected move and exiting before an expected
+    reversal. Same underlying question either way, just applied at
+    whatever point in the window you check it.
+
+    Saved as flip_model.json for continuity with app.py's existing
+    serving hook -- what changed is what the model predicts, not where
+    the artifact lives."""
     X_cols = [c for c in FEATURE_COLS if c in df.columns]
-    df = df.dropna(subset=X_cols + ["label_flip"])
+    df = df.dropna(subset=X_cols + ["label_reversal"])
+    log.info(f"[Reversal] {len(df)} rows remain after dropping rows with no clear "
+              f"existing trend or missing forward Kalshi data")
 
     if df["window_id"].nunique() < 20:
-        log.warning("Not enough late-window rows to train a flip model yet. Skipping.")
+        log.warning("Not enough rows with a usable reversal label yet. Skipping.")
         return None, {}
 
     aucs, briers = [], []
@@ -358,33 +459,35 @@ def train_flip_model(df: pd.DataFrame):
             n_estimators=150, max_depth=3, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
         )
-        model.fit(train_df[X_cols], train_df["label_flip"])
+        model.fit(train_df[X_cols], train_df["label_reversal"])
         preds = model.predict_proba(test_df[X_cols])[:, 1]
-        if test_df["label_flip"].nunique() > 1:
-            aucs.append(roc_auc_score(test_df["label_flip"], preds))
-        briers.append(brier_score_loss(test_df["label_flip"], preds))
+        if test_df["label_reversal"].nunique() > 1:
+            aucs.append(roc_auc_score(test_df["label_reversal"], preds))
+        briers.append(brier_score_loss(test_df["label_reversal"], preds))
 
-    log.info(f"[Flip] walk-forward AUC: {np.mean(aucs) if aucs else float('nan'):.4f} | "
+    log.info(f"[Reversal] walk-forward AUC: {np.mean(aucs) if aucs else float('nan'):.4f} | "
               f"Brier: {np.mean(briers):.4f}")
 
     final_model = xgb.XGBClassifier(
         n_estimators=150, max_depth=3, learning_rate=0.05,
         subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
     )
-    final_model.fit(df[X_cols], df["label_flip"])
+    final_model.fit(df[X_cols], df["label_reversal"])
     return final_model, {"auc": float(np.mean(aucs)) if aucs else None, "brier": float(np.mean(briers))}
 
 
-def save_artifacts(directional_model, flip_model, metrics: dict, feature_cols: list[str]):
+def save_artifacts(directional_model, reversal_model, metrics: dict, feature_cols: list[str]):
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
     directional_model.save_model(os.path.join(ARTIFACT_DIR, "directional_model.json"))
-    if flip_model is not None:
-        flip_model.save_model(os.path.join(ARTIFACT_DIR, "flip_model.json"))
+    if reversal_model is not None:
+        reversal_model.save_model(os.path.join(ARTIFACT_DIR, "flip_model.json"))
     with open(os.path.join(ARTIFACT_DIR, "metadata.json"), "w") as f:
         json.dump({
             "trained_at": datetime.utcnow().isoformat(),
             "feature_cols": feature_cols,
             "metrics": metrics,
+            "note": "flip_model.json now holds the general-purpose reversal model "
+                    "(usable at any point in the window), not the old settlement-only flip model.",
         }, f, indent=2)
 
     try:
@@ -401,9 +504,9 @@ def save_artifacts(directional_model, flip_model, metrics: dict, feature_cols: l
 def main():
     df = load_dataset()
     directional_model, dir_metrics = train_directional_model(df)
-    flip_model, flip_metrics = train_flip_model(df)
-    save_artifacts(directional_model, flip_model,
-                    {"directional": dir_metrics, "flip": flip_metrics},
+    reversal_model, reversal_metrics = train_reversal_model(df)
+    save_artifacts(directional_model, reversal_model,
+                    {"directional": dir_metrics, "reversal": reversal_metrics},
                     [c for c in FEATURE_COLS if c in df.columns])
     log.info("Training complete.")
 

@@ -440,14 +440,14 @@ def live():
         except Exception as e:
             result["directional"] = {"error": str(e)}
 
-    if STATE["flip_model"] is not None and cols and secs_remaining <= 90:
+    if STATE["flip_model"] is not None and cols:
         try:
             import numpy as np
             row = [[feats.get(c.replace("feat_", ""), None) for c in cols]]
             X = np.array(row, dtype=float)
             if not np.isnan(X).any():
-                p_flip = float(STATE["flip_model"].predict_proba(X)[0, 1])
-                result["flip"] = {"p_flip": p_flip}
+                p_reversal = float(STATE["flip_model"].predict_proba(X)[0, 1])
+                result["flip"] = {"p_flip": p_reversal}
         except Exception as e:
             result["flip"] = {"error": str(e)}
 
