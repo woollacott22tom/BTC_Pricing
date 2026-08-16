@@ -86,6 +86,44 @@ def get_window_series(table_name: str, window_id: str, region: str = REGION) -> 
     return sorted(items, key=lambda x: float(x["timestamp"]))
 
 
+def build_imbalance_vs_kalshi_return(exchange_items: list[dict], kalshi_items: list[dict],
+                                       imbalance_field: str = "feat_book_imbalance") -> pd.DataFrame | None:
+    """Different hypothesis than build_aligned_returns: order book imbalance
+    is inherently forward-looking (resting, unexecuted orders reflecting
+    latent pressure), so it's more plausible as a LEADING signal than raw
+    price, which only reflects trades that already happened. This aligns
+    the exchange's imbalance LEVEL (not a return/diff) against Kalshi's
+    return (diff), so correlation_at_lags can test whether imbalance
+    predicts Kalshi's subsequent price movement."""
+    if len(exchange_items) < 5 or len(kalshi_items) < 5:
+        return None
+
+    ex_rows = []
+    for t in exchange_items:
+        if imbalance_field in t and t[imbalance_field] is not None:
+            ex_rows.append({"timestamp": float(t["timestamp"]), "imbalance": float(t[imbalance_field])})
+    if len(ex_rows) < 5:
+        return None
+    ex_df = pd.DataFrame(ex_rows).sort_values("timestamp")
+
+    kl_df = pd.DataFrame({
+        "timestamp": [float(t["timestamp"]) for t in kalshi_items],
+        "yes_mid_cents": [float(t["yes_mid_cents"]) for t in kalshi_items],
+    }).sort_values("timestamp")
+
+    merged = pd.merge_asof(kl_df, ex_df, on="timestamp", direction="backward", tolerance=10.0)
+    merged = merged.dropna(subset=["imbalance", "yes_mid_cents"])
+    if len(merged) < 5:
+        return None
+
+    merged["exchange_return"] = merged["imbalance"]  # reuse correlation_at_lags as-is: treat the
+                                                        # imbalance LEVEL as the "return" series (no diff)
+    merged["kalshi_return"] = merged["yes_mid_cents"].diff() / 100.0
+    merged = merged.dropna(subset=["exchange_return", "kalshi_return"])
+
+    return merged[["timestamp", "exchange_return", "kalshi_return"]]
+
+
 def build_aligned_returns(exchange_items: list[dict], kalshi_items: list[dict]) -> pd.DataFrame | None:
     """Returns a DataFrame with columns [timestamp, exchange_return,
     kalshi_return] aligned via as-of merge, or None if either side is too
@@ -140,6 +178,12 @@ def correlation_at_lags(df: pd.DataFrame, max_lag_steps: int) -> dict[int, float
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exchange", type=str, default="coinbase", choices=list(EXCHANGE_TABLES.keys()))
+    parser.add_argument("--signal", type=str, default="price", choices=["price", "book_imbalance"],
+                         help="'price' tests return-vs-return (does the exchange's PRICE MOVE lead "
+                              "Kalshi's). 'book_imbalance' tests whether the exchange's order book "
+                              "imbalance LEVEL predicts Kalshi's SUBSEQUENT price change -- a "
+                              "different, more forward-looking hypothesis, since resting orders "
+                              "reflect latent pressure not yet visible in trades.")
     parser.add_argument("--max-lag-seconds", type=int, default=20)
     parser.add_argument("--poll-interval", type=float, default=2.0,
                          help="Kalshi poll interval in seconds -- sets the lag step size")
@@ -169,7 +213,11 @@ def main():
         exchange_items = get_window_series(exchange_table, wid, region=args.region)
         kalshi_items = get_window_series(KALSHI_TABLE, wid, region=args.region)
 
-        aligned = build_aligned_returns(exchange_items, kalshi_items)
+        aligned = (
+            build_imbalance_vs_kalshi_return(exchange_items, kalshi_items)
+            if args.signal == "book_imbalance"
+            else build_aligned_returns(exchange_items, kalshi_items)
+        )
         if aligned is None:
             continue
 
@@ -192,8 +240,13 @@ def main():
         lag: float(np.mean(corrs)) for lag, corrs in all_lag_correlations.items() if corrs
     }
 
-    print(f"\n[{args.exchange}] Lag (seconds) -> average correlation across {windows_used} windows ({scope_note}):")
-    print(f"(positive lag = {args.exchange}'s move precedes Kalshi's move by that many seconds)")
+    print(f"\n[{args.exchange} / {args.signal}] Lag (seconds) -> average correlation across {windows_used} windows ({scope_note}):")
+    if args.signal == "book_imbalance":
+        print(f"(positive lag = {args.exchange}'s book imbalance predicts Kalshi's price change "
+              f"that many seconds later -- a POSITIVE correlation supports the imbalance being a "
+              f"real leading indicator, since positive imbalance/buy-pressure should predict Kalshi rising)")
+    else:
+        print(f"(positive lag = {args.exchange}'s move precedes Kalshi's move by that many seconds)")
     for lag_steps in sorted(avg_corr_by_lag.keys()):
         lag_seconds = lag_steps * args.poll_interval
         bar = "#" * int(abs(avg_corr_by_lag[lag_steps]) * 50)
