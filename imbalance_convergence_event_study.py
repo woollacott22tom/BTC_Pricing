@@ -50,6 +50,7 @@ EXCHANGE_TABLES = {"coinbase": "btc_ticks", "kraken": "kraken_ticks", "cryptocom
 KALSHI_TABLE = "kalshi_prices"
 
 TIER_FIELDS = ["feat_imbalance_5", "feat_book_imbalance", "feat_imbalance_20", "feat_imbalance_50"]
+_debug_zero_count = 0
 
 
 def get_recent_window_ids(limit: int, region: str = REGION) -> list[str]:
@@ -243,6 +244,27 @@ def main():
                 key = (direction, trend)
                 surge_by_trend[field].setdefault(key, []).append(change)
                 used_this_window = True
+
+                # DEEP DEBUG: for the first few exact-zero changes on a
+                # trending (non-flat) event, print the actual underlying
+                # rows -- forward_kalshi_change doesn't look at trend at
+                # all, so if zeros cluster specifically on trend!=flat,
+                # something about the interaction needs to be seen directly.
+                global _debug_zero_count
+                if change == 0.0 and trend in ("kalshi_uptrend", "kalshi_downtrend") and _debug_zero_count < 5:
+                    ev_ts = ev["timestamp"]
+                    before = kalshi_df[kalshi_df["timestamp"] <= ev_ts]
+                    after = kalshi_df[kalshi_df["timestamp"] <= ev_ts + args.horizon_seconds]
+                    trend_window = kalshi_df[(kalshi_df["timestamp"] >= ev_ts - args.trend_lookback_seconds) &
+                                              (kalshi_df["timestamp"] <= ev_ts)]
+                    print(f"    [DEEP DEBUG #{_debug_zero_count}] window={wid} event_ts={ev_ts:.2f} trend={trend}")
+                    print(f"      trend_window rows (ts, yes_mid_cents): "
+                          f"{list(zip(trend_window['timestamp'].round(2), trend_window['yes_mid_cents']))}")
+                    print(f"      baseline row: ts={before.iloc[-1]['timestamp']:.2f} "
+                          f"price={before.iloc[-1]['yes_mid_cents']}")
+                    print(f"      target row:   ts={after.iloc[-1]['timestamp']:.2f} "
+                          f"price={after.iloc[-1]['yes_mid_cents']}")
+                    _debug_zero_count += 1
 
         if used_this_window:
             windows_used += 1
