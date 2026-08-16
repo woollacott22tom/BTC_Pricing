@@ -76,6 +76,7 @@ BASE_FEATURES = [
     "recent_range_ratio", "imbalance_5", "imbalance_20", "imbalance_50",
     "spread_change_rate_10s", "spread_zscore_60s",
     "spread_local_extrema_60s", "spread_curvature_60s", "spread_ma_cross_60s",
+    "distance_to_round_100", "distance_to_round_1000",
 ]
 
 EXCHANGE_PREFIXES = {"cb": "btc_ticks", "kr": "kraken_ticks", "cc": "cryptocom_ticks"}
@@ -89,6 +90,20 @@ CONSENSUS_FEATURE_COLS = [
     for suffix in ["n_positive", "n_negative", "all_agree", "mean", "dispersion"]
 ]
 FEATURE_COLS = FEATURE_COLS + CONSENSUS_FEATURE_COLS
+
+# Kalshi's OWN trailing price momentum -- without this, the model has no
+# way to learn "this order-book signal means continuation when Kalshi is
+# already trending, but reversal when it isn't", since it never sees
+# whether Kalshi was trending in the first place. A tree-based model can
+# learn this kind of conditional interaction automatically GIVEN the
+# feature is present -- no need to hand-classify continuation vs reversal
+# the way the standalone event-study script does.
+KALSHI_MOMENTUM_LOOKBACKS = {"kalshi_momentum_15s": 15.0, "kalshi_momentum_60s": 60.0}
+FEATURE_COLS = FEATURE_COLS + list(KALSHI_MOMENTUM_LOOKBACKS.keys())
+FEATURE_COLS = FEATURE_COLS + ["hour_of_day_utc", "day_of_week"]
+KALSHI_MERGE_TOLERANCE_SEC = 20.0  # Kalshi's own API caches responses for 15s server-side
+                                     # (confirmed via kalshi_polling_diagnostic.py) -- a tick
+                                     # older than that is genuinely stale, not just missing
 
 
 def get_generic_window_ticks(table_name: str, window_id: str, region: str = REGION) -> list[dict]:
@@ -121,6 +136,39 @@ def _ticks_to_feature_df(ticks: list[dict], prefix: str) -> pd.DataFrame | None:
     return df if len(df) > 0 else None
 
 
+def _kalshi_ticks_to_momentum_df(kalshi_ticks: list[dict]) -> pd.DataFrame | None:
+    """Builds Kalshi's own trailing momentum at each of ITS OWN tick
+    timestamps -- momentum_Ns(t) = price change over the N seconds up to
+    and including t, using ONLY prior observations (never future ones,
+    which would leak the label). This gets merge_asof'd onto Coinbase's
+    tick grid the same way the other exchanges are, so it's just another
+    input feature from the model's point of view."""
+    if not kalshi_ticks:
+        return None
+    rows = []
+    for t in kalshi_ticks:
+        if "yes_mid_cents" not in t or t["yes_mid_cents"] is None:
+            continue
+        rows.append({"timestamp": float(t["timestamp"]), "yes_mid_cents": float(t["yes_mid_cents"])})
+    if len(rows) < 2:
+        return None
+
+    df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+    for col_name, lookback in KALSHI_MOMENTUM_LOOKBACKS.items():
+        momentum = []
+        for i in range(len(df)):
+            t_now = df["timestamp"].iloc[i]
+            # only rows STRICTLY BEFORE or AT t_now -- no future leakage
+            past = df[(df["timestamp"] <= t_now) & (df["timestamp"] >= t_now - lookback)]
+            if len(past) < 2:
+                momentum.append(np.nan)
+            else:
+                momentum.append(past["yes_mid_cents"].iloc[-1] - past["yes_mid_cents"].iloc[0])
+        df[col_name] = momentum
+
+    return df[["timestamp"] + list(KALSHI_MOMENTUM_LOOKBACKS.keys())]
+
+
 def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool, region: str = REGION) -> pd.DataFrame | None:
     cb_ticks = get_generic_window_ticks("btc_ticks", window_id, region)
     cb_df = _ticks_to_feature_df(cb_ticks, "cb")
@@ -141,11 +189,26 @@ def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool,
                 tolerance=CROSS_EXCHANGE_MERGE_TOLERANCE_SEC,
             )
 
+    kalshi_ticks = get_generic_window_ticks("kalshi_prices", window_id, region)
+    kalshi_momentum_df = _kalshi_ticks_to_momentum_df(kalshi_ticks)
+    if kalshi_momentum_df is not None:
+        merged = pd.merge_asof(
+            merged, kalshi_momentum_df, on="timestamp", direction="backward",
+            tolerance=KALSHI_MERGE_TOLERANCE_SEC,
+        )
+
     merged["window_id"] = window_id
     merged["label_up"] = outcome_up
     merged["label_flip"] = int(flip_occurred)
     cb_seconds_remaining = {float(t["timestamp"]): float(t.get("feat_seconds_remaining", -1)) for t in cb_ticks}
     merged["seconds_remaining"] = merged["timestamp"].map(cb_seconds_remaining)
+
+    # Raw time-of-day/day-of-week -- NOT assuming which hours are "high
+    # volatility"/"institutional" a priori. Letting the model (and separate
+    # analysis) discover empirically whether specific hours show stronger
+    # signal, rather than hand-guessing US market hours or similar.
+    merged["hour_of_day_utc"] = pd.to_datetime(merged["timestamp"], unit="s").dt.hour
+    merged["day_of_week"] = pd.to_datetime(merged["timestamp"], unit="s").dt.dayofweek
 
     merged = add_consensus_features(merged)
 

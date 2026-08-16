@@ -89,8 +89,11 @@ def build_tier_state_df(exchange_ticks: list[dict]) -> pd.DataFrame | None:
     for t in exchange_ticks:
         if not all(f in t and t[f] is not None for f in TIER_FIELDS):
             continue
+        if "price" not in t or t["price"] is None:
+            continue
         vals = [float(t[f]) for f in TIER_FIELDS]
-        rows.append({"timestamp": float(t["timestamp"]), **{f: v for f, v in zip(TIER_FIELDS, vals)}})
+        rows.append({"timestamp": float(t["timestamp"]), "price": float(t["price"]),
+                      **{f: v for f, v in zip(TIER_FIELDS, vals)}})
     if len(rows) < 3:
         return None
 
@@ -108,6 +111,13 @@ def build_tier_state_df(exchange_ticks: list[dict]) -> pd.DataFrame | None:
     df["convergence_event"] = (~df["prev_is_consensus"].fillna(True)) & df["is_consensus"]
     df["flip_event"] = df["prev_top10_sign"].notna() & (df["top10_sign"] != 0) & \
                         (df["prev_top10_sign"] != 0) & (df["top10_sign"] != df["prev_top10_sign"])
+
+    # Distance to the nearest round $100 level -- round numbers act as
+    # informal psychological support/resistance. Used to test whether
+    # events near such a level predict stronger reversals than events
+    # away from one.
+    df["distance_to_round_100"] = df["price"] - (df["price"] / 100.0).round() * 100.0
+    df["hour_of_day_utc"] = pd.to_datetime(df["timestamp"], unit="s").dt.hour
 
     return df
 
@@ -180,6 +190,9 @@ def main():
                          help="How far back to look when classifying whether Kalshi was already trending")
     parser.add_argument("--trend-threshold", type=float, default=0.5,
                          help="Minimum cents of prior Kalshi movement to count as an existing trend")
+    parser.add_argument("--near-round-number-dollars", type=float, default=15.0,
+                         help="An event is 'near a round number' if price is within this many "
+                              "dollars of the nearest round $100 level")
     parser.add_argument("--region", type=str, default=REGION)
     args = parser.parse_args()
 
@@ -189,6 +202,10 @@ def main():
 
     convergence_changes = {1: [], -1: []}
     flip_changes = {1: [], -1: []}
+    flip_by_round_number = {}  # (direction, near_round_number: bool) -> list of changes
+    flip_by_hour = {}  # hour_utc -> list of |change| (magnitude, not direction-split, since
+                        # the claim is about SWING FREQUENCY/SIZE during certain hours,
+                        # not which direction those swings go)
     surge_changes = {field: {1: [], -1: []} for field in TIER_FIELDS}
     # Cross-tabulated by (surge direction, Kalshi's pre-existing trend state) --
     # this is what actually tests continuation-vs-reversal, not just raw forward change
@@ -225,6 +242,11 @@ def main():
             change = forward_kalshi_change(kalshi_df, ev["timestamp"], args.horizon_seconds)
             if change is not None:
                 flip_changes[int(ev["top10_sign"])].append(change)
+                near_round = abs(ev["distance_to_round_100"]) <= args.near_round_number_dollars
+                key = (int(ev["top10_sign"]), near_round)
+                flip_by_round_number.setdefault(key, []).append(change)
+                hour = int(ev["hour_of_day_utc"])
+                flip_by_hour.setdefault(hour, []).append(abs(change))
                 used_this_window = True
 
         for field in TIER_FIELDS:
@@ -291,6 +313,28 @@ def main():
 
     report("Tier convergence events (disagreement -> full consensus)", convergence_changes)
     report("Top-10 sign-flip events", flip_changes)
+
+    print(f"Flip events split by proximity to a round $100 level "
+          f"(within ${args.near_round_number_dollars:.0f}):")
+    print("(tests whether flips NEAR a psychological level predict stronger reversals)")
+    for (direction, near_round), changes in sorted(flip_by_round_number.items()):
+        if not changes:
+            continue
+        arr = np.array(changes)
+        dir_label = "+" if direction > 0 else "-"
+        loc_label = "NEAR round number" if near_round else "away from round number"
+        print(f"  dir={dir_label}  {loc_label:24s}  n={len(arr):4d}  mean_change={arr.mean():+.4f}cents")
+    print()
+
+    print(f"Flip event MAGNITUDE (|forward change|) by hour of day (UTC):")
+    print(f"(tests the claim that swings are bigger/more frequent during certain hours -- e.g.")
+    print(f" institutional trading periods -- rather than assuming which hours those are)")
+    for hour in sorted(flip_by_hour.keys()):
+        changes = flip_by_hour[hour]
+        arr = np.array(changes)
+        bar = "#" * int(arr.mean() * 3)
+        print(f"  hour={hour:02d} UTC  n={len(arr):4d}  mean_|change|={arr.mean():6.3f}cents  {bar}")
+    print()
 
     tier_labels = {
         "feat_imbalance_5": "top-5", "feat_book_imbalance": "top-10",
