@@ -356,6 +356,7 @@ def compute_feature_snapshot(buf: RollingBuffer, strike_price: float, now_ts: fl
         "spread_ma_cross_60s": spread_ma_cross_count(win_60s, ma_window=5),
         "distance_to_round_100": distance_to_round_number(last.price, 100.0),
         "distance_to_round_1000": distance_to_round_number(last.price, 1000.0),
+        "volume_15s": rolling_volume(buf, now_ts, 15.0),
         "volume_60s": rolling_volume(buf, now_ts, 60.0),
     }
     return feat
