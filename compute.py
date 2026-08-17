@@ -145,6 +145,19 @@ def spread_zscore(buf: RollingBuffer, now_ts: float, lookback_seconds: float = 6
     return float((arr[-1] - arr.mean()) / std)
 
 
+def rolling_volume(buf: RollingBuffer, now_ts: float, seconds: float = 60.0) -> float | None:
+    """Total traded volume (sum of individual trade sizes, in the
+    underlying asset's units) over the trailing window -- distinct from
+    every other feature here, which describes book/price STATE rather
+    than trading ACTIVITY. Returns 0.0 (not None) if there are ticks in
+    the window but all report zero volume, vs None if the window is
+    completely empty of ticks."""
+    recent = buf.since(seconds, now_ts)
+    if not recent:
+        return None
+    return sum(t.volume for t in recent if t.volume is not None)
+
+
 def depth_thinning_rate(buf: RollingBuffer, now_ts: float, seconds: float = 10.0) -> float | None:
     """Rate of change of total top-10 depth over the trailing window.
     Negative = depth pulling away (thinning) -> elevated flip risk."""
@@ -157,6 +170,18 @@ def depth_thinning_rate(buf: RollingBuffer, now_ts: float, seconds: float = 10.0
     if len(depths) < 2:
         return None
     return (depths[-1] - depths[0]) / max(depths[0], 1e-9)
+
+
+def distance_to_round_number(price: float, round_to: float) -> float:
+    """Signed distance from price to the nearest round-number level (e.g.
+    round_to=100 for hundred-dollar levels, round_to=1000 for thousand-
+    dollar levels). Round numbers act as informal psychological
+    support/resistance -- stop-losses, take-profits, and algorithmic
+    orders often cluster there. Negative = price is below the nearest
+    round level (approaching it from above would mean price is falling
+    toward support); positive = above it."""
+    nearest = round(price / round_to) * round_to
+    return price - nearest
 
 
 def distance_to_strike_in_stdevs(current_price: float, strike_price: float, vol_1s: float) -> float | None:
@@ -329,5 +354,8 @@ def compute_feature_snapshot(buf: RollingBuffer, strike_price: float, now_ts: fl
         "spread_local_extrema_60s": spread_local_extrema_count(win_60s),
         "spread_curvature_60s": spread_curvature(win_60s),
         "spread_ma_cross_60s": spread_ma_cross_count(win_60s, ma_window=5),
+        "distance_to_round_100": distance_to_round_number(last.price, 100.0),
+        "distance_to_round_1000": distance_to_round_number(last.price, 1000.0),
+        "volume_60s": rolling_volume(buf, now_ts, 60.0),
     }
     return feat
