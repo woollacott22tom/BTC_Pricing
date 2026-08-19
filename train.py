@@ -77,6 +77,7 @@ BASE_FEATURES = [
     "spread_change_rate_10s", "spread_zscore_60s",
     "spread_local_extrema_60s", "spread_curvature_60s", "spread_ma_cross_60s",
     "distance_to_round_100", "distance_to_round_1000",
+    "volume_15s", "volume_60s",
 ]
 
 EXCHANGE_PREFIXES = {"cb": "btc_ticks", "kr": "kraken_ticks", "cc": "cryptocom_ticks"}
