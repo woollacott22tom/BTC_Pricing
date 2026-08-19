@@ -173,6 +173,7 @@ async def feed_loop():
                     channel = msg.get("channel")
                     now = datetime.now(timezone.utc)
                     now_ts = now.timestamp()
+                    trade_volume_this_message = 0.0
 
                     if channel == "l2_data":
                         for event in msg.get("events", []):
@@ -185,18 +186,23 @@ async def feed_loop():
                             for trade in event.get("trades", []):
                                 try:
                                     price = float(trade["price"])
+                                    volume = float(trade["size"])
                                 except (KeyError, TypeError, ValueError):
                                     continue
                                 last_trade_price = price
+                                trade_volume_this_message += volume
 
                     # Fires on EVERY message (book or trade), not just trade
                     # arrival -- same fix as run_ingestion.py's standalone
                     # service. Coinbase's level2 book updates independently
                     # of trades; gating on trade arrival meant book-only
                     # movement never reached the live /live response.
+                    # trade_volume_this_message is 0.0 for book-only
+                    # messages (correct -- no trade happened at that exact
+                    # instant) and the real trade size when one did.
                     if last_trade_price is not None:
                         tick = Tick(
-                            ts=now_ts, price=last_trade_price, volume=0.0,
+                            ts=now_ts, price=last_trade_price, volume=trade_volume_this_message,
                             best_bid=book.best_bid(), best_ask=book.best_ask(),
                             bid_depth_top10=book.top10_bid_depth(),
                             ask_depth_top10=book.top10_ask_depth(),
@@ -237,6 +243,7 @@ async def kraken_feed_loop():
                     channel = msg.get("channel")
                     now = datetime.now(timezone.utc)
                     now_ts = now.timestamp()
+                    trade_volume_this_message = 0.0
 
                     if channel == "book":
                         msg_type = msg.get("type")
@@ -247,15 +254,17 @@ async def kraken_feed_loop():
                         for entry in msg.get("data", []):
                             try:
                                 price = float(entry["price"])
+                                volume = float(entry["qty"])
                             except (KeyError, TypeError, ValueError):
                                 continue
                             last_trade_price = price
+                            trade_volume_this_message += volume
 
                     # Fires on EVERY message (book or trade) -- same fix as
                     # kraken_ingestion.py's standalone service.
                     if last_trade_price is not None:
                         tick = Tick(
-                            ts=now_ts, price=last_trade_price, volume=0.0,
+                            ts=now_ts, price=last_trade_price, volume=trade_volume_this_message,
                             best_bid=book.best_bid(), best_ask=book.best_ask(),
                             bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
                             bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
@@ -302,6 +311,7 @@ async def cryptocom_feed_loop():
                     channel = result.get("channel") or msg.get("channel")
                     now = datetime.now(timezone.utc)
                     now_ts = now.timestamp()
+                    trade_volume_this_message = 0.0
 
                     if channel == "book":
                         for entry in result.get("data", []):
@@ -312,8 +322,9 @@ async def cryptocom_feed_loop():
                             parsed = _cryptocom_try_parse_trade(entry)
                             if parsed is None:
                                 continue
-                            price, _volume = parsed
+                            price, volume = parsed
                             last_trade_price = price
+                            trade_volume_this_message += volume
 
                     # Fires on EVERY message (book or trade), not just trade
                     # arrival -- same fix as crypto_ingestion.py. The book
@@ -322,7 +333,7 @@ async def cryptocom_feed_loop():
                     # movement never reached the live /live response either.
                     if last_trade_price is not None:
                         tick = Tick(
-                            ts=now_ts, price=last_trade_price, volume=0.0,
+                            ts=now_ts, price=last_trade_price, volume=trade_volume_this_message,
                             best_bid=book.best_bid(), best_ask=book.best_ask(),
                             bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
                             bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
