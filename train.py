@@ -115,6 +115,34 @@ KALSHI_MERGE_TOLERANCE_SEC = 20.0  # Kalshi's own API caches responses for 15s s
                                      # (confirmed via kalshi_polling_diagnostic.py) -- a tick
                                      # older than that is genuinely stale, not just missing
 
+# Before this timestamp, all three exchanges' ingestion services logged
+# ticks ONLY when a trade fired -- book-only movement between trades (the
+# actual mechanism behind several patterns discussed: Coinbase's book
+# gradually flipping through many small fills during a slow move vs.
+# Crypto.com sitting negative until one large trade forces a snap
+# confirmation) was invisible to storage. Order-book-derived features and
+# volume from before this cutoff aren't just sparser -- they're shaped
+# wrong, having been forced through the same coarse, trade-gated sampling
+# regardless of which exchange actually produced them, which can flatten
+# or hide the exact asymmetry between exchanges that makes them useful.
+# Price/momentum features are NOT excluded here -- past discussion
+# concluded that gap is real but much less consequential than the
+# book-state one.
+#
+# This uses the LATER of two separate deploys (Coinbase + Kraken fix) as
+# a single, conservative, uniform cutoff for all three exchanges -- the
+# Crypto.com fix landed separately and earlier, but that exact timestamp
+# wasn't confirmed with certainty, so the safer later cutoff is used
+# everywhere rather than guessing at an earlier one.
+ORDER_BOOK_FIX_CUTOFF_TS = 1787118936.0  # 2026-08-19T05:55:36+00:00 UTC
+
+ORDER_BOOK_AND_VOLUME_FEATURES = {
+    "book_imbalance", "imbalance_5", "imbalance_20", "imbalance_50",
+    "spread", "spread_change_rate_10s", "spread_zscore_60s",
+    "spread_local_extrema_60s", "spread_curvature_60s", "spread_ma_cross_60s",
+    "depth_thinning_10s", "volume_15s", "volume_60s",
+}
+
 # Cross-exchange price gap features -- does one exchange trade at a
 # persistent premium/discount to another, and is the CURRENT gap wider or
 # narrower than its own recent typical level? The raw dollar gap alone
@@ -351,6 +379,20 @@ def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool,
 
     merged = add_consensus_features(merged)
 
+    # Drop pre-cutoff ticks entirely -- see ORDER_BOOK_FIX_CUTOFF_TS comment
+    # above. NOTE: this is the simple, safe version -- it drops the WHOLE
+    # row, which also discards otherwise-still-valid price/momentum data
+    # from those same moments, not just the untrusted order-book/volume
+    # columns. A more surgical version (NaN only the untrusted columns,
+    # keep the row, rely on XGBoost's native missing-value handling) is
+    # possible but bigger and untested -- worth building if the row-level
+    # cut turns out too costly once there's enough post-cutoff data to
+    # compare against.
+    before_cutoff = len(merged)
+    merged = merged[merged["timestamp"] >= ORDER_BOOK_FIX_CUTOFF_TS].reset_index(drop=True)
+    if before_cutoff > len(merged):
+        merged.attrs["rows_dropped_pre_cutoff"] = before_cutoff - len(merged)
+
     return merged
 
 
@@ -402,6 +444,7 @@ def load_dataset() -> pd.DataFrame:
 
     windows = sorted(windows, key=lambda w: w["window_id"])
     all_dfs = []
+    total_dropped_pre_cutoff = 0
     for w in windows:
         wid = w["window_id"]
         # Prefer Kalshi's own authoritative settlement result (written by
@@ -416,6 +459,7 @@ def load_dataset() -> pd.DataFrame:
         flip_occurred = bool(w.get("flip_occurred", False))
         window_df = build_window_dataframe(wid, outcome_up, flip_occurred, region=REGION)
         if window_df is not None:
+            total_dropped_pre_cutoff += window_df.attrs.get("rows_dropped_pre_cutoff", 0)
             all_dfs.append(window_df)
 
     if not all_dfs:
@@ -424,6 +468,10 @@ def load_dataset() -> pd.DataFrame:
 
     df = pd.concat(all_dfs, ignore_index=True)
     log.info(f"Built dataset: {len(df)} rows across {df['window_id'].nunique()} windows")
+    if total_dropped_pre_cutoff > 0:
+        cutoff_dt = datetime.utcfromtimestamp(ORDER_BOOK_FIX_CUTOFF_TS).isoformat() + "Z"
+        log.info(f"Dropped {total_dropped_pre_cutoff} pre-cutoff rows (before {cutoff_dt}) -- "
+                 f"order-book/volume data from before the book-logging fix was excluded as unreliable.")
 
     for prefix, table_name in EXCHANGE_PREFIXES.items():
         cols_present = [c for c in FEATURE_COLS if c.startswith(f"{prefix}_") and c in df.columns]
