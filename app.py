@@ -376,12 +376,12 @@ async def startup():
 
 
 @app.get("/health")
-def health():
+async def health():
     return {"ok": True, "window_id": STATE["window_id"], "ticks_buffered": len(STATE["buf"].ticks)}
 
 
 @app.get("/live")
-def live():
+async def live():
     buf = STATE["buf"]
     if not buf.ticks or STATE["strike_price"] is None:
         return {"status": "warming_up"}
