@@ -166,6 +166,7 @@ async def feed_loop():
                 await ws.send(json.dumps(_subscribe_msg("market_trades")))
                 await ws.send(json.dumps(_subscribe_msg("level2")))
                 book = OrderBook()
+                last_trade_price = None
 
                 async for raw in ws:
                     msg = json.loads(raw)
@@ -184,26 +185,32 @@ async def feed_loop():
                             for trade in event.get("trades", []):
                                 try:
                                     price = float(trade["price"])
-                                    volume = float(trade["size"])
                                 except (KeyError, TypeError, ValueError):
                                     continue
+                                last_trade_price = price
 
-                                tick = Tick(
-                                    ts=now_ts, price=price, volume=volume,
-                                    best_bid=book.best_bid(), best_ask=book.best_ask(),
-                                    bid_depth_top10=book.top10_bid_depth(),
-                                    ask_depth_top10=book.top10_ask_depth(),
-                                    bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
-                                    bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
-                                    bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
-                                )
-                                STATE["buf"].add(tick)
+                    # Fires on EVERY message (book or trade), not just trade
+                    # arrival -- same fix as run_ingestion.py's standalone
+                    # service. Coinbase's level2 book updates independently
+                    # of trades; gating on trade arrival meant book-only
+                    # movement never reached the live /live response.
+                    if last_trade_price is not None:
+                        tick = Tick(
+                            ts=now_ts, price=last_trade_price, volume=0.0,
+                            best_bid=book.best_bid(), best_ask=book.best_ask(),
+                            bid_depth_top10=book.top10_bid_depth(),
+                            ask_depth_top10=book.top10_ask_depth(),
+                            bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                            bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                            bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
+                        )
+                        STATE["buf"].add(tick)
 
-                                wid = window_id_for(now)
-                                if STATE["window_id"] != wid:
-                                    STATE["window_id"] = wid
-                                    STATE["strike_price"] = price
-                                    log.info(f"[serving] window rolled: {wid} strike={price}")
+                        wid = window_id_for(now)
+                        if STATE["window_id"] != wid:
+                            STATE["window_id"] = wid
+                            STATE["strike_price"] = last_trade_price
+                            log.info(f"[serving] window rolled: {wid} strike={last_trade_price}")
 
         except Exception as e:
             log.error(f"[serving] feed error: {e}, retrying in {backoff}s")
@@ -223,6 +230,7 @@ async def kraken_feed_loop():
                 await ws.send(json.dumps(_kraken_subscribe_msg("trade")))
                 await ws.send(json.dumps(_kraken_subscribe_msg("book")))
                 book = KrakenOrderBook()
+                last_trade_price = None
 
                 async for raw in ws:
                     msg = json.loads(raw)
@@ -239,25 +247,28 @@ async def kraken_feed_loop():
                         for entry in msg.get("data", []):
                             try:
                                 price = float(entry["price"])
-                                volume = float(entry["qty"])
                             except (KeyError, TypeError, ValueError):
                                 continue
+                            last_trade_price = price
 
-                            tick = Tick(
-                                ts=now_ts, price=price, volume=volume,
-                                best_bid=book.best_bid(), best_ask=book.best_ask(),
-                                bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
-                                bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
-                                bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
-                                bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
-                            )
-                            KRAKEN_STATE["buf"].add(tick)
+                    # Fires on EVERY message (book or trade) -- same fix as
+                    # kraken_ingestion.py's standalone service.
+                    if last_trade_price is not None:
+                        tick = Tick(
+                            ts=now_ts, price=last_trade_price, volume=0.0,
+                            best_bid=book.best_bid(), best_ask=book.best_ask(),
+                            bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
+                            bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                            bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                            bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
+                        )
+                        KRAKEN_STATE["buf"].add(tick)
 
-                            wid = window_id_for(now)
-                            if KRAKEN_STATE["window_id"] != wid:
-                                KRAKEN_STATE["window_id"] = wid
-                                KRAKEN_STATE["strike_price"] = price
-                                log.info(f"[serving/kraken] window rolled: {wid} strike={price}")
+                        wid = window_id_for(now)
+                        if KRAKEN_STATE["window_id"] != wid:
+                            KRAKEN_STATE["window_id"] = wid
+                            KRAKEN_STATE["strike_price"] = last_trade_price
+                            log.info(f"[serving/kraken] window rolled: {wid} strike={last_trade_price}")
 
         except Exception as e:
             log.error(f"[serving/kraken] feed error: {e}, retrying in {backoff}s")
@@ -278,6 +289,7 @@ async def cryptocom_feed_loop():
                 await asyncio.sleep(1.0)
                 await ws.send(json.dumps(_cryptocom_subscribe_msg()))
                 book = CryptoComOrderBook()
+                last_trade_price = None
 
                 async for raw in ws:
                     msg = json.loads(raw)
@@ -300,23 +312,30 @@ async def cryptocom_feed_loop():
                             parsed = _cryptocom_try_parse_trade(entry)
                             if parsed is None:
                                 continue
-                            price, volume = parsed
+                            price, _volume = parsed
+                            last_trade_price = price
 
-                            tick = Tick(
-                                ts=now_ts, price=price, volume=volume,
-                                best_bid=book.best_bid(), best_ask=book.best_ask(),
-                                bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
-                                bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
-                                bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
-                                bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
-                            )
-                            CRYPTOCOM_STATE["buf"].add(tick)
+                    # Fires on EVERY message (book or trade), not just trade
+                    # arrival -- same fix as crypto_ingestion.py. The book
+                    # refreshes on its own ~500ms cadence independent of
+                    # trades; gating on trade arrival meant book-only
+                    # movement never reached the live /live response either.
+                    if last_trade_price is not None:
+                        tick = Tick(
+                            ts=now_ts, price=last_trade_price, volume=0.0,
+                            best_bid=book.best_bid(), best_ask=book.best_ask(),
+                            bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
+                            bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                            bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                            bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
+                        )
+                        CRYPTOCOM_STATE["buf"].add(tick)
 
-                            wid = window_id_for(now)
-                            if CRYPTOCOM_STATE["window_id"] != wid:
-                                CRYPTOCOM_STATE["window_id"] = wid
-                                CRYPTOCOM_STATE["strike_price"] = price
-                                log.info(f"[serving/cryptocom] window rolled: {wid} strike={price}")
+                        wid = window_id_for(now)
+                        if CRYPTOCOM_STATE["window_id"] != wid:
+                            CRYPTOCOM_STATE["window_id"] = wid
+                            CRYPTOCOM_STATE["strike_price"] = last_trade_price
+                            log.info(f"[serving/cryptocom] window rolled: {wid} strike={last_trade_price}")
 
         except Exception as e:
             log.error(f"[serving/cryptocom] feed error: {e}, retrying in {backoff}s")

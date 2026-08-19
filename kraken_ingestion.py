@@ -67,6 +67,8 @@ async def run():
     strike_price: float | None = None
     current_window_id: str | None = None
     last_logged = 0.0
+    last_trade_price: float | None = None
+    pending_volume = 0.0
 
     # Same trade-flow diagnostic added to crypto_ingestion.py, for a fair
     # apples-to-apples comparison of actual trade frequency between feeds.
@@ -115,45 +117,54 @@ async def run():
                                 volume = float(entry["qty"])
                             except (KeyError, TypeError, ValueError):
                                 continue
-
-                            tick = Tick(
-                                ts=now_ts, price=price, volume=volume,
-                                best_bid=book.best_bid(), best_ask=book.best_ask(),
-                                bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
-                                bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
-                                bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
-                                bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
-                            )
-                            buf.add(tick)
-
-                            wid = window_id_for(now)
-                            if current_window_id != wid:
-                                current_window_id = wid
-                                strike_price = price
-                                log.info(f"Window rolled: {wid} strike={price}")
-
-                            if now_ts - last_logged >= TICK_LOG_INTERVAL_SEC:
-                                feats = compute_feature_snapshot(buf, strike_price, now_ts)
-                                feats["seconds_remaining"] = seconds_remaining(now, current_window_id)
-                                put_kraken_tick(
-                                    window_id=current_window_id,
-                                    timestamp=now_ts,
-                                    tick_fields={
-                                        "price": price, "volume": volume,
-                                        "best_bid": tick.best_bid, "best_ask": tick.best_ask,
-                                        "bid_depth_top10": tick.bid_depth_top10,
-                                        "ask_depth_top10": tick.ask_depth_top10,
-                                        "bid_depth_5": tick.bid_depth_5, "ask_depth_5": tick.ask_depth_5,
-                                        "bid_depth_20": tick.bid_depth_20, "ask_depth_20": tick.ask_depth_20,
-                                        "bid_depth_50": tick.bid_depth_50, "ask_depth_50": tick.ask_depth_50,
-                                    },
-                                    features=feats,
-                                    region_name=REGION,
-                                )
-                                last_logged = now_ts
+                            last_trade_price = price
+                            pending_volume += volume
 
                     elif msg.get("method") == "subscribe" and not msg.get("success", True):
                         log.error(f"Kraken subscribe error: {msg}")
+
+                    # Fires on EVERY message (book or trade), not just trade
+                    # arrival -- Kraken's book updates independently of
+                    # trades; gating on trade arrival meant book-only
+                    # movement was invisible to the stored dataset. Also
+                    # fixes volume from multiple trades arriving between
+                    # log points being silently dropped instead of summed.
+                    if last_trade_price is not None and now_ts - last_logged >= TICK_LOG_INTERVAL_SEC:
+                        tick = Tick(
+                            ts=now_ts, price=last_trade_price, volume=pending_volume,
+                            best_bid=book.best_bid(), best_ask=book.best_ask(),
+                            bid_depth_top10=book.bid_depth(10), ask_depth_top10=book.ask_depth(10),
+                            bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                            bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                            bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
+                        )
+                        buf.add(tick)
+
+                        wid = window_id_for(now)
+                        if current_window_id != wid:
+                            current_window_id = wid
+                            strike_price = last_trade_price
+                            log.info(f"Window rolled: {wid} strike={last_trade_price}")
+
+                        feats = compute_feature_snapshot(buf, strike_price, now_ts)
+                        feats["seconds_remaining"] = seconds_remaining(now, current_window_id)
+                        put_kraken_tick(
+                            window_id=current_window_id,
+                            timestamp=now_ts,
+                            tick_fields={
+                                "price": last_trade_price, "volume": pending_volume,
+                                "best_bid": tick.best_bid, "best_ask": tick.best_ask,
+                                "bid_depth_top10": tick.bid_depth_top10,
+                                "ask_depth_top10": tick.ask_depth_top10,
+                                "bid_depth_5": tick.bid_depth_5, "ask_depth_5": tick.ask_depth_5,
+                                "bid_depth_20": tick.bid_depth_20, "ask_depth_20": tick.ask_depth_20,
+                                "bid_depth_50": tick.bid_depth_50, "ask_depth_50": tick.ask_depth_50,
+                            },
+                            features=feats,
+                            region_name=REGION,
+                        )
+                        last_logged = now_ts
+                        pending_volume = 0.0
 
         except websockets.ConnectionClosed as e:
             log.warning(f"WebSocket closed, reconnecting... code={e.code} reason={e.reason!r}")

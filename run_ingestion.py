@@ -115,6 +115,8 @@ async def run():
     buf = RollingBuffer(max_seconds=900)
     state = WindowState()
     last_logged = 0.0
+    last_trade_price: float | None = None
+    pending_volume = 0.0
 
     async for ws in _reconnecting_ws(ADVANCED_TRADE_WS):
         try:
@@ -142,48 +144,64 @@ async def run():
                                 volume = float(trade["size"])
                             except (KeyError, TypeError, ValueError):
                                 continue
-
-                            tick = Tick(
-                                ts=now_ts, price=price, volume=volume,
-                                best_bid=book.best_bid(), best_ask=book.best_ask(),
-                                bid_depth_top10=book.top10_bid_depth(),
-                                ask_depth_top10=book.top10_ask_depth(),
-                                bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
-                                bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
-                                bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
-                            )
-                            buf.add(tick)
-
-                            rolled = state.maybe_roll(now, price)
-                            if rolled:
-                                closed_window_id, closed_summary = rolled
-                                put_window_summary(closed_window_id, closed_summary, region_name=REGION)
-                                log.info(f"Window closed: outcome={closed_summary['outcome']} flip={closed_summary['flip_occurred']}")
-
-                            state.record_settlement_tick(now, price)
-
-                            if now_ts - last_logged >= TICK_LOG_INTERVAL_SEC:
-                                feats = compute_feature_snapshot(buf, state.strike_price, now_ts)
-                                feats["seconds_remaining"] = seconds_remaining(now, state.window_id)
-                                put_tick(
-                                    window_id=state.window_id,
-                                    timestamp=now_ts,
-                                    tick_fields={
-                                        "price": price, "volume": volume,
-                                        "best_bid": tick.best_bid, "best_ask": tick.best_ask,
-                                        "bid_depth_top10": tick.bid_depth_top10,
-                                        "ask_depth_top10": tick.ask_depth_top10,
-                                        "bid_depth_5": tick.bid_depth_5, "ask_depth_5": tick.ask_depth_5,
-                                        "bid_depth_20": tick.bid_depth_20, "ask_depth_20": tick.ask_depth_20,
-                                        "bid_depth_50": tick.bid_depth_50, "ask_depth_50": tick.ask_depth_50,
-                                    },
-                                    features=feats,
-                                    region_name=REGION,
-                                )
-                                last_logged = now_ts
+                            last_trade_price = price
+                            pending_volume += volume
 
                 elif msg.get("type") == "error":
                     log.error(f"Coinbase feed error: {msg}")
+
+                # Unified ~1s heartbeat -- fires on EVERY message (book or
+                # trade), gated to TICK_LOG_INTERVAL_SEC so this stays a
+                # roughly TIME-weighted sample rate rather than being
+                # skewed by how bursty incoming messages are. Previously
+                # window rollover detection and settlement-period sampling
+                # were both nested inside the trade branch only, meaning:
+                #   (a) book-only movement was invisible to the stored
+                #       dataset entirely, and
+                #   (b) the settlement TWAP approximation never sampled
+                #       between trades, even though BRTI's real settlement
+                #       is order-book-based, not purely trade-based --
+                #       gating this on trades made our approximation
+                #       systematically less accurate than it needed to be.
+                if last_trade_price is not None and now_ts - last_logged >= TICK_LOG_INTERVAL_SEC:
+                    rolled = state.maybe_roll(now, last_trade_price)
+                    if rolled:
+                        closed_window_id, closed_summary = rolled
+                        put_window_summary(closed_window_id, closed_summary, region_name=REGION)
+                        log.info(f"Window closed: outcome={closed_summary['outcome']} flip={closed_summary['flip_occurred']}")
+
+                    state.record_settlement_tick(now, last_trade_price)
+
+                    tick = Tick(
+                        ts=now_ts, price=last_trade_price, volume=pending_volume,
+                        best_bid=book.best_bid(), best_ask=book.best_ask(),
+                        bid_depth_top10=book.top10_bid_depth(),
+                        ask_depth_top10=book.top10_ask_depth(),
+                        bid_depth_5=book.bid_depth(5), ask_depth_5=book.ask_depth(5),
+                        bid_depth_20=book.bid_depth(20), ask_depth_20=book.ask_depth(20),
+                        bid_depth_50=book.bid_depth(50), ask_depth_50=book.ask_depth(50),
+                    )
+                    buf.add(tick)
+
+                    feats = compute_feature_snapshot(buf, state.strike_price, now_ts)
+                    feats["seconds_remaining"] = seconds_remaining(now, state.window_id)
+                    put_tick(
+                        window_id=state.window_id,
+                        timestamp=now_ts,
+                        tick_fields={
+                            "price": last_trade_price, "volume": pending_volume,
+                            "best_bid": tick.best_bid, "best_ask": tick.best_ask,
+                            "bid_depth_top10": tick.bid_depth_top10,
+                            "ask_depth_top10": tick.ask_depth_top10,
+                            "bid_depth_5": tick.bid_depth_5, "ask_depth_5": tick.ask_depth_5,
+                            "bid_depth_20": tick.bid_depth_20, "ask_depth_20": tick.ask_depth_20,
+                            "bid_depth_50": tick.bid_depth_50, "ask_depth_50": tick.ask_depth_50,
+                        },
+                        features=feats,
+                        region_name=REGION,
+                    )
+                    last_logged = now_ts
+                    pending_volume = 0.0
 
         except websockets.ConnectionClosed as e:
             log.warning(f"WebSocket closed, reconnecting... code={e.code} reason={e.reason!r}")
