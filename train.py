@@ -114,6 +114,51 @@ KALSHI_MERGE_TOLERANCE_SEC = 20.0  # Kalshi's own API caches responses for 15s s
                                      # (confirmed via kalshi_polling_diagnostic.py) -- a tick
                                      # older than that is genuinely stale, not just missing
 
+# Cross-exchange price gap features -- does one exchange trade at a
+# persistent premium/discount to another, and is the CURRENT gap wider or
+# narrower than its own recent typical level? The raw dollar gap alone
+# isn't very informative on its own (a persistent baseline offset carries
+# little predictive signal by itself), but DEVIATION from that baseline
+# is: it isolates "the gap is unusual right now" from "there's always some
+# gap", matching the specific pattern of a gap widening during a price
+# move and reverting once the move settles.
+PRICE_DIFF_PAIRS = [("cc", "cb"), ("kr", "cb")]
+# Multiple rolling baselines, not just one -- a single hand-picked window
+# (e.g. 60s) bakes in a specific guess about the right timescale. Giving
+# the model several windows lets it discover which one (if any) actually
+# carries signal, rather than betting everything on one assumption drawn
+# from limited manual observation.
+PRICE_DIFF_ROLLING_BASELINE_SECS = [30.0, 60.0, 120.0]
+PRICE_DIFF_FEATURE_COLS = []
+for _other, _base in PRICE_DIFF_PAIRS:
+    PRICE_DIFF_FEATURE_COLS.append(f"price_diff_{_other}_{_base}")
+    for _window in PRICE_DIFF_ROLLING_BASELINE_SECS:
+        PRICE_DIFF_FEATURE_COLS.append(f"price_diff_{_other}_{_base}_deviation_{int(_window)}s")
+FEATURE_COLS = FEATURE_COLS + PRICE_DIFF_FEATURE_COLS
+
+
+def add_price_differential_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds raw cross-exchange price gaps and their deviation from SEVERAL
+    trailing rolling baselines (not just one -- see PRICE_DIFF_ROLLING_BASELINE_SECS
+    comment). Uses TIME-based rolling windows (not fixed row counts), which
+    only look backward from each row's own timestamp -- no future leakage,
+    correct regardless of how tick frequency varies between exchanges."""
+    df = df.copy()
+    df["_dt"] = pd.to_datetime(df["timestamp"], unit="s")
+    df = df.set_index("_dt")
+
+    for other, base in PRICE_DIFF_PAIRS:
+        other_col, base_col = f"{other}_price", f"{base}_price"
+        if other_col not in df.columns or base_col not in df.columns:
+            continue
+        diff_col = f"price_diff_{other}_{base}"
+        df[diff_col] = df[other_col] - df[base_col]
+        for window in PRICE_DIFF_ROLLING_BASELINE_SECS:
+            rolling_mean = df[diff_col].rolling(f"{int(window)}s", min_periods=3).mean()
+            df[f"{diff_col}_deviation_{int(window)}s"] = df[diff_col] - rolling_mean
+
+    return df.reset_index(drop=True)
+
 
 def get_generic_window_ticks(table_name: str, window_id: str, region: str = REGION) -> list[dict]:
     dynamodb = boto3.resource("dynamodb", region_name=region)
@@ -136,6 +181,8 @@ def _ticks_to_feature_df(ticks: list[dict], prefix: str) -> pd.DataFrame | None:
     rows = []
     for t in ticks:
         row = {"timestamp": float(t["timestamp"])}
+        if "price" in t and t["price"] is not None:
+            row[f"{prefix}_price"] = float(t["price"])
         for feat in BASE_FEATURES:
             key = f"feat_{feat}"
             if key in t and t[key] is not None:
@@ -271,6 +318,8 @@ def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool,
                 tolerance=CROSS_EXCHANGE_MERGE_TOLERANCE_SEC,
             )
 
+    merged = add_price_differential_features(merged)
+
     kalshi_ticks = get_generic_window_ticks("kalshi_prices", window_id, region)
     kalshi_momentum_df = _kalshi_ticks_to_momentum_df(kalshi_ticks)
     if kalshi_momentum_df is not None:
@@ -354,7 +403,15 @@ def load_dataset() -> pd.DataFrame:
     all_dfs = []
     for w in windows:
         wid = w["window_id"]
-        outcome_up = 1 if w.get("outcome") == "up" else 0
+        # Prefer Kalshi's own authoritative settlement result (written by
+        # kalshi_settlement_reconciliation.py) over our own Coinbase-TWAP
+        # approximation whenever it's available -- Kalshi's real outcome
+        # is ground truth, our own calculation is only an approximation
+        # of it. Falls back to our own outcome for windows that haven't
+        # been reconciled yet (e.g. very recent ones, or if the
+        # reconciliation script hasn't been run since).
+        true_outcome = w.get("kalshi_true_outcome")
+        outcome_up = 1 if (true_outcome or w.get("outcome")) == "up" else 0
         flip_occurred = bool(w.get("flip_occurred", False))
         window_df = build_window_dataframe(wid, outcome_up, flip_occurred, region=REGION)
         if window_df is not None:
