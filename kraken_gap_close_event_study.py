@@ -117,13 +117,19 @@ def build_gap_series(target_ticks: list[dict], other1_ticks: list[dict], other2_
 
 
 def detect_gap_close_events(gap_df: pd.DataFrame, persist_seconds: float,
-                              gap_open_threshold: float, gap_close_threshold: float) -> pd.DataFrame:
+                              gap_open_threshold: float, gap_close_threshold: float,
+                              min_same_sign_fraction: float = 0.8) -> pd.DataFrame:
     """For each tick, checks whether the trailing persist_seconds window
     shows a PERSISTENT, consistently-signed gap (a real sustained lag),
     and whether the CURRENT gap has since dropped sharply (Kraken caught
-    up). Uses simple trailing-window filtering (Kraken's tick counts are
-    small enough that this is fast and easy to verify correct, matching
-    the style already used for trend detection in the sibling script)."""
+    up). Uses the window's MEAN gap magnitude and a same-sign FRACTION
+    (not requiring every single tick to individually qualify) -- real
+    market gaps wobble continuously even during a genuine sustained lag,
+    so requiring unanimous agreement across every tick in the window is
+    unrealistically strict and produces false negatives (confirmed: the
+    original all-ticks-must-qualify version found zero events across 300
+    real windows, which is itself evidence the detector was too strict,
+    not that the underlying pattern doesn't occur)."""
     df = gap_df.copy()
     was_persistent = []
     prior_direction = []
@@ -136,10 +142,15 @@ def detect_gap_close_events(gap_df: pd.DataFrame, persist_seconds: float,
             prior_direction.append(0)
             continue
         gaps = window["gap"].values
-        all_positive = (gaps >= gap_open_threshold).all()
-        all_negative = (gaps <= -gap_open_threshold).all()
-        was_persistent.append(bool(all_positive or all_negative))
-        prior_direction.append(1 if all_positive else (-1 if all_negative else 0))
+        mean_gap = gaps.mean()
+        if abs(mean_gap) < gap_open_threshold:
+            was_persistent.append(False)
+            prior_direction.append(0)
+            continue
+        same_sign_fraction = float((np.sign(gaps) == np.sign(mean_gap)).mean())
+        is_persistent = same_sign_fraction >= min_same_sign_fraction
+        was_persistent.append(is_persistent)
+        prior_direction.append((1 if mean_gap > 0 else -1) if is_persistent else 0)
 
     df["was_persistent_gap"] = was_persistent
     df["prior_gap_direction"] = prior_direction
@@ -230,7 +241,7 @@ def main():
     print(f" a REVERSAL -- Kraken's catch-up signals the move is fully absorbed, not that it continues)")
     for direction, changes in changes_by_direction.items():
         if not changes:
-            print(f"  direction={'+' if direction > 0 else '-'} (Kraken was above/below Coinbase): no events found")
+            print(f"  direction={'+' if direction > 0 else '-'} ({args.target_exchange} above/below the other two's average): no events found")
             continue
         arr = np.array(changes)
         dir_label = (f"+ ({args.target_exchange} was ABOVE the other two's average, closing down)" if direction > 0
