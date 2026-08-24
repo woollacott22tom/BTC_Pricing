@@ -85,14 +85,14 @@ def build_gap_series(target_ticks: list[dict], other1_ticks: list[dict], other2_
     Coinbase-vs-Crypto.com gap closing alongside Kraken catching up was
     observed together), so any exchange can now be tested against the
     consensus of the other two, not just Kraken against Coinbase."""
-    if len(target_ticks) < 3 or len(other1_ticks) < 3 or len(other2_ticks) < 3:
+    if len(target_ticks) < 1 or len(other1_ticks) < 1 or len(other2_ticks) < 1:
         return None
 
     target_df = pd.DataFrame({
         "timestamp": [float(t["timestamp"]) for t in target_ticks],
         "target_price": [float(t["price"]) for t in target_ticks if "price" in t],
     }).sort_values("timestamp")
-    if len(target_df) < 3:
+    if len(target_df) < 1:
         return None
 
     other1_df = pd.DataFrame({
@@ -108,7 +108,7 @@ def build_gap_series(target_ticks: list[dict], other1_ticks: list[dict], other2_
     merged = pd.merge_asof(target_df, other1_df, on="timestamp", direction="backward", tolerance=10.0)
     merged = pd.merge_asof(merged, other2_df, on="timestamp", direction="backward", tolerance=10.0)
     merged = merged.dropna(subset=["target_price", "other1_price", "other2_price"])
-    if len(merged) < 5:
+    if len(merged) < 1:
         return None
 
     merged["avg_other"] = (merged["other1_price"] + merged["other2_price"]) / 2.0
@@ -137,7 +137,7 @@ def detect_gap_close_events(gap_df: pd.DataFrame, persist_seconds: float,
     for i in range(len(df)):
         t_now = df["timestamp"].iloc[i]
         window = df[(df["timestamp"] >= t_now - persist_seconds) & (df["timestamp"] < t_now)]
-        if len(window) < 3:
+        if len(window) < 1:
             was_persistent.append(False)
             prior_direction.append(0)
             continue
