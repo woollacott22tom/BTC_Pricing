@@ -187,6 +187,10 @@ def main():
                          help="Maximum |gap| to count as 'closed'")
     parser.add_argument("--horizon-seconds", type=float, default=45.0)
     parser.add_argument("--region", type=str, default=REGION)
+    parser.add_argument("--diagnose-gaps-only", action="store_true",
+                         help="Skip event detection entirely -- just print the real observed "
+                              "gap magnitude distribution, to choose thresholds from evidence "
+                              "instead of continuing to guess after repeated zero-event runs")
     args = parser.parse_args()
 
     exchange_tables = {"kraken": "kraken_ticks", "coinbase": "btc_ticks", "cryptocom": "cryptocom_ticks"}
@@ -194,6 +198,34 @@ def main():
     other_tables = [t for name, t in exchange_tables.items() if name != args.target_exchange]
 
     window_ids = get_recent_window_ids(args.windows, region=args.region)
+
+    if args.diagnose_gaps_only:
+        all_gaps = []
+        for wid in window_ids:
+            target_ticks = get_window_ticks(target_table, wid, region=args.region)
+            other1_ticks = get_window_ticks(other_tables[0], wid, region=args.region)
+            other2_ticks = get_window_ticks(other_tables[1], wid, region=args.region)
+            gap_df = build_gap_series(target_ticks, other1_ticks, other2_ticks)
+            if gap_df is not None:
+                all_gaps.extend(gap_df["gap"].tolist())
+
+        if not all_gaps:
+            print("No gap data found at all -- check that all three exchanges have ticks in these windows.")
+            return
+
+        arr = np.array(all_gaps)
+        print(f"=== Real {args.target_exchange} vs (average of other two) gap distribution ===")
+        print(f"n={len(arr)} observations across {len(window_ids)} windows")
+        print(f"mean={arr.mean():+.2f}  median={np.median(arr):+.2f}  std={arr.std():.2f}")
+        print(f"min={arr.min():+.2f}  max={arr.max():+.2f}")
+        for pct in [50, 75, 90, 95, 99]:
+            print(f"  {pct}th percentile of |gap|: {np.percentile(np.abs(arr), pct):.2f}")
+        print(f"\n% of observations with |gap| >= $50 (current default threshold): "
+              f"{100*float((np.abs(arr) >= 50).mean()):.2f}%")
+        print(f"% of observations with |gap| >= $20: {100*float((np.abs(arr) >= 20).mean()):.2f}%")
+        print(f"% of observations with |gap| >= $10: {100*float((np.abs(arr) >= 10).mean()):.2f}%")
+        return
+
     log.info(f"Checking {len(window_ids)} windows for {args.target_exchange} gap-close events "
              f"(vs average of the other two)")
 
