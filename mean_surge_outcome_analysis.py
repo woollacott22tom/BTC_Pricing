@@ -75,7 +75,7 @@ def get_all_windows(region: str = REGION) -> list[dict]:
             continue
         true_outcome = i.get("kalshi_true_outcome")
         outcome = true_outcome or i.get("outcome")
-        strike = i.get("kalshi_true_strike") or i.get("strike_price")
+        strike = i.get("kalshi_true_strike") or i.get("open_price")
         if outcome not in ("up", "down") or strike is None:
             continue
         window_ts = datetime.fromisoformat(i["window_id"]).timestamp()
