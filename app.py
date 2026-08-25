@@ -30,7 +30,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from window_utils import window_id_for, seconds_remaining
-from compute import Tick, RollingBuffer, compute_feature_snapshot
+from compute import Tick, RollingBuffer, compute_feature_snapshot, compute_mean_surge_indicator
 from order_book import OrderBook
 from jwt_auth import build_ws_jwt
 from kraken_order_book import KrakenOrderBook
@@ -444,6 +444,7 @@ async def live():
         "features": feats,
         "directional": None,
         "flip": None,
+        "mean_surge": None,
         "kraken": None,
         "kalshi_strike": KALSHI_STATE["strike"],
         "kalshi_ticker": KALSHI_STATE["ticker"],
@@ -451,6 +452,14 @@ async def live():
         "kalshi_yes_ask_cents": KALSHI_STATE["yes_ask_cents"],
         "cryptocom": None,
     }
+
+    # Mean/surge signal -- validated in mean_surge_outcome_analysis.py.
+    # See compute_mean_surge_indicator's docstring for the exact backtest
+    # numbers behind the strong/weak classification.
+    window_start_ts = datetime.fromisoformat(STATE["window_id"]).timestamp()
+    mean_surge = compute_mean_surge_indicator(buf, STATE["strike_price"], window_start_ts, now_ts)
+    if mean_surge is not None:
+        result["mean_surge"] = mean_surge
 
     kraken_buf = KRAKEN_STATE["buf"]
     if kraken_buf.ticks and KRAKEN_STATE["strike_price"] is not None:

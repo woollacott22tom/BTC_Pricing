@@ -360,3 +360,44 @@ def compute_feature_snapshot(buf: RollingBuffer, strike_price: float, now_ts: fl
         "volume_60s": rolling_volume(buf, now_ts, 60.0),
     }
     return feat
+
+
+def compute_mean_surge_indicator(buf: RollingBuffer, strike_price: float, window_start_ts: float,
+                                   now_ts: float, late_window_seconds: float = 120.0) -> dict | None:
+    """Live version of the indicator validated in mean_surge_outcome_analysis.py:
+      - mean position (early-window average vs strike) AGREES with the late-
+        window move -> ~85% directional accuracy in that direction ("strong")
+      - mean and late move DISAGREE -> still ~68-71% accuracy in the MEAN's
+        direction (the late move never actually flips the majority outcome
+        in backtest data, only partially offsets it) -> "weak", not a flip
+
+    Returns None during the first late_window_seconds of a window (no valid
+    early/late split exists yet), or if there isn't enough tick data on
+    either side of the split to compute a meaningful average.
+    """
+    if now_ts - window_start_ts < late_window_seconds:
+        return None
+
+    late_boundary_ts = now_ts - late_window_seconds
+    all_ticks = buf.since(now_ts - window_start_ts, now_ts)
+    early_ticks = [t for t in all_ticks if t.ts < late_boundary_ts]
+    late_ticks = [t for t in all_ticks if t.ts >= late_boundary_ts]
+
+    if len(early_ticks) < 3 or len(late_ticks) < 2:
+        return None
+
+    mean_price = sum(t.price for t in early_ticks) / len(early_ticks)
+    mean_position = "above" if mean_price > strike_price else "below"
+    late_change = late_ticks[-1].price - early_ticks[-1].price
+
+    if mean_position == "above":
+        signal = "strong_up" if late_change > 0 else "weak_up"
+    else:
+        signal = "strong_down" if late_change < 0 else "weak_down"
+
+    return {
+        "mean_position": mean_position,
+        "mean_price": mean_price,
+        "late_change": late_change,
+        "signal": signal,
+    }
