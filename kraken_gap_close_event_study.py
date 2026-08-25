@@ -13,6 +13,16 @@ one-tick blip), Kraken finally moving to close it may be a genuine
 because the move was large enough to matter, rather than reacting to
 every small fluctuation the way Coinbase's constant tick stream does.
 
+IMPORTANT MECHANISM SPLIT: a gap can close two structurally different
+ways -- (a) the target exchange (e.g. Kraken) moves to catch up to the
+other two, or (b) the other two move BACK toward a target that never
+moved at all (Coinbase/Crypto.com passing through a still-pegged level).
+These are potentially opposite-implication events; treating them as one
+event type dilutes whatever real signal exists in either mechanism on its
+own. Each detected event is now classified by which side actually did
+most of the moving, and only "target confirms" events (not "others passed
+through") count toward the main results by default.
+
 Method, per window:
   1. Align Coinbase's price onto Kraken's own (sparse) tick timestamps.
   2. Compute gap(t) = kraken_price(t) - coinbase_price(t).
@@ -22,13 +32,14 @@ Method, per window:
           -- a real, sustained lag, not noise flipping back and forth.
        b. The CURRENT gap has dropped sharply (|gap| < gap_close_threshold)
           -- Kraken just caught up.
-  4. Measure Kalshi's forward price change after each such event, split by
-     which direction the gap was closing FROM (i.e. which way Kraken was
-     lagging) -- this is the direction the hypothesis predicts Kalshi
-     should move.
+       c. The TARGET exchange accounted for most of the movement that
+          closed the gap (not the other two moving toward a pegged target).
+  4. Measure Kalshi's forward price change after each such event, AT
+     MULTIPLE HORIZONS (not just one), split by which direction the gap
+     was closing FROM.
 
 Usage:
-    python3 kraken_gap_close_event_study.py [--windows 100] [--horizon-seconds 45]
+    python3 kraken_gap_close_event_study.py [--windows 100] [--horizons 5,10,30,45]
 """
 from __future__ import annotations
 import argparse
@@ -79,12 +90,7 @@ def get_window_ticks(table_name: str, window_id: str, region: str = REGION) -> l
 
 def build_gap_series(target_ticks: list[dict], other1_ticks: list[dict], other2_ticks: list[dict]) -> pd.DataFrame | None:
     """gap(t) = target_price(t) - average(other1_price(t), other2_price(t)),
-    aligned onto the TARGET exchange's own (sparser) tick timestamps.
-    Generalized from an earlier fixed Kraken-vs-Coinbase-only version --
-    real observation showed this pattern isn't specific to one pair (a
-    Coinbase-vs-Crypto.com gap closing alongside Kraken catching up was
-    observed together), so any exchange can now be tested against the
-    consensus of the other two, not just Kraken against Coinbase."""
+    aligned onto the TARGET exchange's own (sparser) tick timestamps."""
     if len(target_ticks) < 1 or len(other1_ticks) < 1 or len(other2_ticks) < 1:
         return None
 
@@ -121,39 +127,60 @@ def detect_gap_close_events(gap_df: pd.DataFrame, persist_seconds: float,
                               min_same_sign_fraction: float = 0.8) -> pd.DataFrame:
     """For each tick, checks whether the trailing persist_seconds window
     shows a PERSISTENT, consistently-signed gap (a real sustained lag),
-    and whether the CURRENT gap has since dropped sharply (Kraken caught
-    up). Uses the window's MEAN gap magnitude and a same-sign FRACTION
-    (not requiring every single tick to individually qualify) -- real
-    market gaps wobble continuously even during a genuine sustained lag,
-    so requiring unanimous agreement across every tick in the window is
-    unrealistically strict and produces false negatives (confirmed: the
-    original all-ticks-must-qualify version found zero events across 300
-    real windows, which is itself evidence the detector was too strict,
-    not that the underlying pattern doesn't occur)."""
+    and whether the CURRENT gap has since dropped sharply (target caught
+    up). Also classifies each event by WHICH SIDE did the moving -- the
+    target exchange catching up to the others ("target confirms"), or the
+    average of the other two moving back toward a still-pegged target
+    ("others passed through"). Stored as target_moved_fraction: fraction
+    of the COMBINED absolute movement (target's own move + the other
+    two's average move) attributable to the target's own price change,
+    over the same trailing window. 1.0 = target did all the moving;
+    0.0 = the others did all the moving; None if there's not enough data
+    in the window to compute this."""
     df = gap_df.copy()
     was_persistent = []
     prior_direction = []
+    target_moved_fraction = []
 
     for i in range(len(df)):
         t_now = df["timestamp"].iloc[i]
         window = df[(df["timestamp"] >= t_now - persist_seconds) & (df["timestamp"] < t_now)]
+
         if len(window) < 1:
             was_persistent.append(False)
             prior_direction.append(0)
+            target_moved_fraction.append(None)
             continue
+
         gaps = window["gap"].values
         mean_gap = gaps.mean()
         if abs(mean_gap) < gap_open_threshold:
             was_persistent.append(False)
             prior_direction.append(0)
+            target_moved_fraction.append(None)
             continue
+
         same_sign_fraction = float((np.sign(gaps) == np.sign(mean_gap)).mean())
         is_persistent = same_sign_fraction >= min_same_sign_fraction
         was_persistent.append(is_persistent)
         prior_direction.append((1 if mean_gap > 0 else -1) if is_persistent else 0)
 
+        # Mechanism split: compare how much the TARGET's own price moved vs
+        # how much the AVG_OTHER moved, over the same trailing window
+        # (inclusive of the current/closing tick) that established persistence.
+        window_and_now = df[(df["timestamp"] >= t_now - persist_seconds) & (df["timestamp"] <= t_now)]
+        if len(window_and_now) >= 2:
+            target_move = abs(window_and_now["target_price"].iloc[-1] - window_and_now["target_price"].iloc[0])
+            other_move = abs(window_and_now["avg_other"].iloc[-1] - window_and_now["avg_other"].iloc[0])
+            total_move = target_move + other_move
+            frac = (target_move / total_move) if total_move > 0 else 0.5
+        else:
+            frac = None
+        target_moved_fraction.append(frac)
+
     df["was_persistent_gap"] = was_persistent
     df["prior_gap_direction"] = prior_direction
+    df["target_moved_fraction"] = target_moved_fraction
     df["gap_close_event"] = df["was_persistent_gap"] & (df["gap"].abs() < gap_close_threshold)
 
     return df
@@ -185,13 +212,21 @@ def main():
                               "real observed case, NOT a validated threshold; treat as a starting point")
     parser.add_argument("--gap-close-dollars", type=float, default=5.0,
                          help="Maximum |gap| to count as 'closed'")
-    parser.add_argument("--horizon-seconds", type=float, default=45.0)
+    parser.add_argument("--horizons", type=str, default="5,10,30,45",
+                         help="Comma-separated list of forward horizons (seconds) to check, "
+                              "all computed from the SAME detected events in one pass")
+    parser.add_argument("--min-target-moved-fraction", type=float, default=0.6,
+                         help="Minimum fraction of the combined movement that must come from the "
+                              "TARGET exchange's own price change for an event to count as "
+                              "'target confirms' rather than 'others passed through'. Set to 0.0 "
+                              "to disable the mechanism split entirely (old behavior).")
     parser.add_argument("--region", type=str, default=REGION)
     parser.add_argument("--diagnose-gaps-only", action="store_true",
                          help="Skip event detection entirely -- just print the real observed "
-                              "gap magnitude distribution, to choose thresholds from evidence "
-                              "instead of continuing to guess after repeated zero-event runs")
+                              "gap magnitude distribution")
     args = parser.parse_args()
+
+    horizons = [float(h.strip()) for h in args.horizons.split(",")]
 
     exchange_tables = {"kraken": "kraken_ticks", "coinbase": "btc_ticks", "cryptocom": "cryptocom_ticks"}
     target_table = exchange_tables[args.target_exchange]
@@ -220,17 +255,17 @@ def main():
         print(f"min={arr.min():+.2f}  max={arr.max():+.2f}")
         for pct in [50, 75, 90, 95, 99]:
             print(f"  {pct}th percentile of |gap|: {np.percentile(np.abs(arr), pct):.2f}")
-        print(f"\n% of observations with |gap| >= $50 (current default threshold): "
-              f"{100*float((np.abs(arr) >= 50).mean()):.2f}%")
-        print(f"% of observations with |gap| >= $20: {100*float((np.abs(arr) >= 20).mean()):.2f}%")
-        print(f"% of observations with |gap| >= $10: {100*float((np.abs(arr) >= 10).mean()):.2f}%")
         return
 
     log.info(f"Checking {len(window_ids)} windows for {args.target_exchange} gap-close events "
-             f"(vs average of the other two)")
+             f"(vs average of the other two), horizons={horizons}")
 
-    changes_by_direction = {1: [], -1: []}
+    # changes_by_direction[horizon][direction] -> list of forward changes,
+    # split further into "target confirms" vs "others passed through"
+    changes_target_confirms = {h: {1: [], -1: []} for h in horizons}
+    changes_others_passed = {h: {1: [], -1: []} for h in horizons}
     windows_used = 0
+    events_excluded_ambiguous = 0
 
     for wid in window_ids:
         target_ticks = get_window_ticks(target_table, wid, region=args.region)
@@ -256,42 +291,52 @@ def main():
 
         used_this_window = False
         for _, ev in events.iterrows():
-            change = forward_kalshi_change(kalshi_df, ev["timestamp"], args.horizon_seconds)
-            if change is not None:
-                direction = int(ev["prior_gap_direction"])
-                if direction in changes_by_direction:
-                    changes_by_direction[direction].append(change)
+            direction = int(ev["prior_gap_direction"])
+            if direction not in (1, -1):
+                continue
+
+            frac = ev["target_moved_fraction"]
+            if frac is None or (isinstance(frac, float) and np.isnan(frac)):
+                events_excluded_ambiguous += 1
+                continue
+
+            bucket = changes_target_confirms if frac >= args.min_target_moved_fraction else changes_others_passed
+
+            for h in horizons:
+                change = forward_kalshi_change(kalshi_df, ev["timestamp"], h)
+                if change is not None:
+                    bucket[h][direction].append(change)
                     used_this_window = True
 
         if used_this_window:
             windows_used += 1
 
-    log.info(f"Used {windows_used} windows with at least one gap-close event\n")
+    log.info(f"Used {windows_used} windows with at least one gap-close event. "
+             f"{events_excluded_ambiguous} events excluded (couldn't determine which side moved).\n")
 
-    print(f"=== Kraken gap-close events (forward Kalshi change over {args.horizon_seconds}s) ===")
-    print(f"(direction = which way Kraken was lagging before it caught up; theory predicts")
-    print(f" a REVERSAL -- Kraken's catch-up signals the move is fully absorbed, not that it continues)")
-    for direction, changes in changes_by_direction.items():
-        if not changes:
-            print(f"  direction={'+' if direction > 0 else '-'} ({args.target_exchange} above/below the other two's average): no events found")
-            continue
-        arr = np.array(changes)
-        dir_label = (f"+ ({args.target_exchange} was ABOVE the other two's average, closing down)" if direction > 0
-                     else f"- ({args.target_exchange} was BELOW the other two's average, closing up)")
-        # Hypothesis is REVERSAL, not continuation, matching the real observed
-        # example: Kraken lagged ABOVE Coinbase during a down-move (hadn't
-        # caught down yet), and when it finally did catch down (closing a
-        # positive gap), the reversal (price going back UP) followed shortly
-        # after -- i.e. Kraken's catch-up signals the move is now fully
-        # absorbed/exhausted, not that it's about to continue. So:
-        #   direction=+1 (was above, closing down) predicts Kalshi UP afterward
-        #   direction=-1 (was below, closing up) predicts Kalshi DOWN afterward
-        aligned = (direction > 0 and arr.mean() > 0) or (direction < 0 and arr.mean() < 0)
-        tag = "predicts REVERSAL in EXPECTED direction" if aligned else "CONTRADICTS expectation" if arr.mean() != 0 else "no clear effect"
-        print(f"  {dir_label}: n={len(arr):4d}  mean_change={arr.mean():+.4f}cents  "
-              f"median={np.median(arr):+.4f}  std={arr.std():.4f}  [{tag}]")
+    def print_section(title, changes_by_horizon):
+        print(f"=== {title} ===")
+        for h in horizons:
+            print(f"\n--- horizon={h:.0f}s ---")
+            for direction, changes in changes_by_horizon[h].items():
+                if not changes:
+                    print(f"  direction={'+' if direction > 0 else '-'}: no events found")
+                    continue
+                arr = np.array(changes)
+                dir_label = (f"+ ({args.target_exchange} was ABOVE, closing down)" if direction > 0
+                             else f"- ({args.target_exchange} was BELOW, closing up)")
+                aligned = (direction > 0 and arr.mean() > 0) or (direction < 0 and arr.mean() < 0)
+                tag = "predicts REVERSAL in EXPECTED direction" if aligned else ("CONTRADICTS expectation" if arr.mean() != 0 else "no clear effect")
+                print(f"  {dir_label}: n={len(arr):4d}  mean_change={arr.mean():+.4f}cents  "
+                      f"median={np.median(arr):+.4f}  [{tag}]")
+        print()
 
-    print(f"\nCaveat: gap-close events requiring {args.persist_seconds}s of sustained lag are likely rare --")
+    print_section(f"TARGET CONFIRMS ({args.target_exchange}'s own price did most of the moving, "
+                   f"fraction >= {args.min_target_moved_fraction})", changes_target_confirms)
+    print_section(f"OTHERS PASSED THROUGH (the average of the other two did most of the moving -- "
+                   f"{args.target_exchange} was pegged, not confirming anything)", changes_others_passed)
+
+    print(f"Caveat: gap-close events requiring {args.persist_seconds}s of sustained lag are likely rare --")
     print(f"small n here is expected, not a sign of a bug. Treat this as a first read.")
 
 
