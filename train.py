@@ -48,9 +48,7 @@ import re
 import sys
 import gc
 import json
-import shutil
 import logging
-import tempfile
 from datetime import datetime
 
 import numpy as np
@@ -470,61 +468,97 @@ def load_dataset() -> pd.DataFrame:
     # so this doesn't introduce a new dependency (pyarrow) that may not be
     # installed on the box -- pickle round-trips pandas dtypes/NaNs exactly
     # and needs nothing beyond pandas itself.
-    # NOTE: explicitly NOT using the default /tmp -- confirmed via `mount`
-    # that /tmp on this box is tmpfs (RAM-backed), capped at ~460MB. Writing
-    # the per-window cache there would have hit that ceiling before ever
-    # threatening the real memory limit, defeating the whole point of
-    # streaming to disk. The root filesystem (/dev/nvme0n1p1) is real EBS
-    # storage with ~21GB free -- genuinely off-heap, not memory in disguise.
-    cache_dir = tempfile.mkdtemp(prefix="train_window_cache_", dir="/home/ec2-user")
-    log.info(f"Streaming per-window dataframes to {cache_dir} to bound peak memory")
+    #
+    # FIXED, persistent location (not a randomly-suffixed tempdir) so an
+    # interrupted run -- confirmed directly: a 1966-window run was killed
+    # by SSM's execution timeout after processing 1142 of them -- can be
+    # RESUMED by a later, separate process invocation rather than starting
+    # over from zero. Explicitly NOT using the default /tmp -- confirmed
+    # via `mount` that /tmp on this box is tmpfs (RAM-backed), capped at
+    # ~460MB. The root filesystem (/dev/nvme0n1p1) is real EBS storage
+    # with ~21GB free -- genuinely off-heap, not memory in disguise.
+    #
+    # Deliberately NOT auto-deleted at the end of a run -- an interrupted
+    # run's partial progress needs to survive until the NEXT run picks it
+    # back up. Safe to manually clear this directory (rm -rf) if you ever
+    # want a guaranteed fully-fresh rebuild, e.g. after changing
+    # FEATURE_COLS in a way that would make old cached rows stale.
+    cache_dir = "/home/ec2-user/train_window_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    log.info(f"Using persistent window cache at {cache_dir} (enables resuming an interrupted run)")
 
     total_dropped_pre_cutoff = 0
-    windows_written = 0
-    try:
-        for idx, w in enumerate(windows):
-            wid = w["window_id"]
-            # Prefer Kalshi's own authoritative settlement result (written
-            # by kalshi_settlement_reconciliation.py) over our own
-            # Coinbase-TWAP approximation whenever it's available --
-            # Kalshi's real outcome is ground truth, our own calculation
-            # is only an approximation of it. Falls back to our own
-            # outcome for windows that haven't been reconciled yet.
-            true_outcome = w.get("kalshi_true_outcome")
-            outcome_up = 1 if (true_outcome or w.get("outcome")) == "up" else 0
-            flip_occurred = bool(w.get("flip_occurred", False))
-            window_df = build_window_dataframe(wid, outcome_up, flip_occurred, region=REGION)
+    windows_processed_this_run = 0
+    windows_resumed_from_cache = 0
 
-            if window_df is not None and len(window_df) > 0:
-                total_dropped_pre_cutoff += window_df.attrs.get("rows_dropped_pre_cutoff", 0)
-                out_path = os.path.join(cache_dir, _safe_cache_filename(wid))
-                window_df.to_pickle(out_path)
-                windows_written += 1
+    for idx, w in enumerate(windows):
+        wid = w["window_id"]
+        out_path = os.path.join(cache_dir, _safe_cache_filename(wid))
 
-            del window_df  # prompt release of this window's processing overhead
-                             # before starting the next one, rather than letting
-                             # it linger alongside everything still to come
+        if os.path.exists(out_path):
+            # Confirm the cached file is actually readable, not a partial
+            # write from a run that got killed mid-write -- exactly the
+            # failure mode a timeout/OOM kill could produce. A file that
+            # fails to read back is treated as NOT cached and rebuilt from
+            # scratch, rather than silently crashing later during the
+            # final combined read-back (or worse, silently proceeding
+            # with an incomplete row).
+            try:
+                cached_df = pd.read_pickle(out_path)
+                total_dropped_pre_cutoff += cached_df.attrs.get("rows_dropped_pre_cutoff", 0)
+                del cached_df
+                windows_resumed_from_cache += 1
+                continue
+            except Exception as e:
+                log.warning(f"Cached file for {wid} failed to read back ({e}) -- rebuilding it")
 
-            # Periodic explicit GC -- doesn't force numpy/pandas' underlying
-            # C allocators to hand memory back to the OS (they typically
-            # retain freed blocks for reuse rather than releasing them), so
-            # this won't necessarily show up as falling RSS in `free -h`.
-            # What it DOES do is catch reference cycles that pure
-            # refcounting can miss, keeping peak growth bounded rather than
-            # silently accumulating over a run spanning 1000+ windows.
-            if idx % 50 == 0:
-                gc.collect()
+        # Prefer Kalshi's own authoritative settlement result (written by
+        # kalshi_settlement_reconciliation.py) over our own Coinbase-TWAP
+        # approximation whenever it's available -- Kalshi's real outcome
+        # is ground truth, our own calculation is only an approximation
+        # of it. Falls back to our own outcome for windows that haven't
+        # been reconciled yet.
+        true_outcome = w.get("kalshi_true_outcome")
+        outcome_up = 1 if (true_outcome or w.get("outcome")) == "up" else 0
+        flip_occurred = bool(w.get("flip_occurred", False))
+        window_df = build_window_dataframe(wid, outcome_up, flip_occurred, region=REGION)
 
-        if windows_written == 0:
-            log.warning("No usable windows with tick data found. Exiting.")
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            sys.exit(0)
+        if window_df is not None and len(window_df) > 0:
+            total_dropped_pre_cutoff += window_df.attrs.get("rows_dropped_pre_cutoff", 0)
+            window_df.to_pickle(out_path)
+            windows_processed_this_run += 1
 
-        log.info(f"Wrote {windows_written} window dataframes to disk; reading back for training...")
-        cached_files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".pkl")]
-        df = pd.concat([pd.read_pickle(f) for f in cached_files], ignore_index=True)
-    finally:
-        shutil.rmtree(cache_dir, ignore_errors=True)
+        del window_df  # prompt release of this window's processing overhead
+                         # before starting the next one, rather than letting
+                         # it linger alongside everything still to come
+
+        # Periodic explicit GC -- doesn't force numpy/pandas' underlying
+        # C allocators to hand memory back to the OS (they typically
+        # retain freed blocks for reuse rather than releasing them), so
+        # this won't necessarily show up as falling RSS in `free -h`.
+        # What it DOES do is catch reference cycles that pure
+        # refcounting can miss, keeping peak growth bounded rather than
+        # silently accumulating over a run spanning 1000+ windows.
+        if idx % 50 == 0:
+            gc.collect()
+
+    log.info(f"{windows_resumed_from_cache} windows resumed from a prior run's cache, "
+             f"{windows_processed_this_run} newly processed this run")
+
+    cached_files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".pkl")]
+    if not cached_files:
+        log.warning("No usable windows with tick data found. Exiting.")
+        sys.exit(0)
+
+    # NOTE: this step still reads every cached window's dataframe back into
+    # memory at once to build the final combined dataset -- resume avoids
+    # REPEATING the expensive per-window DynamoDB fetch/feature-computation
+    # work across separate runs, but does not by itself reduce this final
+    # step's peak memory. That remains a separate, real concern worth
+    # addressing directly if it becomes the next bottleneck, e.g. by
+    # training on chunked reads instead of one full in-memory concat.
+    log.info(f"Reading back {len(cached_files)} cached window dataframes for training...")
+    df = pd.concat([pd.read_pickle(f) for f in cached_files], ignore_index=True)
 
     log.info(f"Built dataset: {len(df)} rows across {df['window_id'].nunique()} windows")
     if total_dropped_pre_cutoff > 0:
