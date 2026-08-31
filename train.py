@@ -523,9 +523,31 @@ def load_dataset() -> pd.DataFrame:
     windows = list_closed_windows(region_name=REGION)
     windows = [w for w in windows if w.get("source") != "backfill"]
     log.info(f"Found {len(windows)} closed non-backfill windows in btc_windows")
+
+    # Exclude windows ENTIRELY before the book-logging fix cutoff before
+    # ever fetching their tick data -- previously these were fully fetched
+    # (4 separate DynamoDB queries each: btc_ticks, kraken_ticks,
+    # cryptocom_ticks, kalshi_prices) only to have every single row
+    # dropped afterward inside build_window_dataframe(), wasting real
+    # fetch time and memory for zero usable rows. Only excludes windows
+    # whose FULL 900s span ends at or before the cutoff; the one window
+    # that straddles the cutoff boundary is still fetched normally and
+    # correctly row-filtered as before (some of its rows are genuinely
+    # post-cutoff and usable).
+    before_filter_count = len(windows)
+    windows = [
+        w for w in windows
+        if datetime.fromisoformat(w["window_id"]).timestamp() + 900.0 > ORDER_BOOK_FIX_CUTOFF_TS
+    ]
+    skipped_entirely_pre_cutoff = before_filter_count - len(windows)
+    if skipped_entirely_pre_cutoff > 0:
+        log.info(f"Excluding {skipped_entirely_pre_cutoff} windows entirely before the "
+                 f"book-logging fix cutoff -- never fetching their tick data, since every "
+                 f"row would be dropped anyway")
+
     if len(windows) < MIN_WINDOWS_REQUIRED:
         log.warning(
-            f"Only {len(windows)} windows available (< {MIN_WINDOWS_REQUIRED} minimum). "
+            f"Only {len(windows)} usable (post-cutoff) windows available (< {MIN_WINDOWS_REQUIRED} minimum). "
             "Keep collecting data before training -- an undertrained model here "
             "is worse than no model. Exiting."
         )
@@ -582,19 +604,28 @@ def load_dataset() -> pd.DataFrame:
         out_path = os.path.join(cache_dir, _safe_cache_filename(wid))
 
         if os.path.exists(out_path):
-            # Confirm the cached file is actually readable, not a partial
-            # write from a run that got killed mid-write -- exactly the
-            # failure mode a timeout/OOM kill could produce. A file that
-            # fails to read back is treated as NOT cached and rebuilt from
-            # scratch, rather than silently crashing later during the
-            # final combined read-back (or worse, silently proceeding
-            # with an incomplete row).
+            # Confirm the cached file is actually readable AND has every
+            # column the CURRENT schema expects -- not just "did it read
+            # back." A cache built before a schema change (e.g. adding
+            # label_strike_cross) would otherwise be silently reused
+            # as-is, missing whatever's new, and only fail later --
+            # confusingly -- during training or not at all if dropna
+            # just quietly drops those rows. Required label columns are
+            # checked explicitly here since they're exactly the columns
+            # most likely to be added incrementally over time.
             try:
                 cached_df = pd.read_pickle(out_path)
-                total_dropped_pre_cutoff += cached_df.attrs.get("rows_dropped_pre_cutoff", 0)
-                del cached_df
-                windows_resumed_from_cache += 1
-                continue
+                required_cols = {"label_reversal", "label_strike_cross"}
+                missing = required_cols - set(cached_df.columns)
+                if missing:
+                    log.warning(f"Cached file for {wid} predates current schema "
+                                 f"(missing {missing}) -- rebuilding it")
+                    del cached_df
+                else:
+                    total_dropped_pre_cutoff += cached_df.attrs.get("rows_dropped_pre_cutoff", 0)
+                    del cached_df
+                    windows_resumed_from_cache += 1
+                    continue
             except Exception as e:
                 log.warning(f"Cached file for {wid} failed to read back ({e}) -- rebuilding it")
 
