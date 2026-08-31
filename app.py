@@ -12,7 +12,7 @@ origin (GitHub Pages). Tighten `allow_origins` to your actual dashboard
 domain once you know it.
 
 Endpoints:
-  GET /live       -> current window's live directional + flip scores
+  GET /live       -> current window's live reversal score
   GET /health     -> liveness check
 """
 from __future__ import annotations
@@ -30,7 +30,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from window_utils import window_id_for, seconds_remaining
-from compute import Tick, RollingBuffer, compute_feature_snapshot, compute_mean_surge_indicator
+from compute import (
+    Tick, RollingBuffer, compute_feature_snapshot, compute_mean_surge_indicator,
+    build_live_feature_row, RollingSeries, compute_price_diff_deviation_features,
+    compute_kalshi_momentum_features,
+)
 from order_book import OrderBook
 from jwt_auth import build_ws_jwt
 from kraken_order_book import KrakenOrderBook
@@ -98,7 +102,6 @@ STATE = {
     "buf": RollingBuffer(max_seconds=900),
     "window_id": None,
     "strike_price": None,
-    "directional_model": None,
     "flip_model": None,
     "feature_cols": [],
 }
@@ -127,30 +130,45 @@ KALSHI_STATE = {
     "ticker": None,
     "yes_bid_cents": None,
     "yes_ask_cents": None,
+    # Rolling history of Kalshi's own mid price -- needed to compute
+    # kalshi_momentum_15s/60s live, the same way train.py computes it from
+    # stored ticks. Bounded to 90s: comfortably covers the 60s lookback
+    # plus margin, without keeping unbounded history in memory.
+    "price_history": RollingSeries(max_seconds=90.0),
+}
+
+# Rolling cross-exchange price-gap history -- needed to compute the
+# price_diff_*_deviation_* features live, the same way
+# add_price_differential_features() does from stored ticks. Bounded to
+# 150s: comfortably covers the largest (120s) rolling baseline plus
+# margin. Persists across /live calls (module-level state) so the rolling
+# history actually accumulates over time rather than resetting every poll.
+PRICE_DIFF_STATE = {
+    "cc_cb": RollingSeries(max_seconds=150.0),
+    "kr_cb": RollingSeries(max_seconds=150.0),
 }
 
 
 def load_models():
+    """NOTE: directional model intentionally not loaded/served anymore --
+    settlement prediction was scrapped in favor of focusing on the
+    reversal model. flip_model.json (the general-purpose reversal model,
+    not the old settlement-only flip predictor) is the only model this
+    endpoint scores against now."""
     feature_cols = []
     if os.path.exists(FEATURE_COLS_PATH):
         with open(FEATURE_COLS_PATH) as f:
             feature_cols = json.load(f).get("feature_cols", [])
 
-    directional_model = None
     flip_model = None
-    dpath = os.path.join(ARTIFACT_DIR, "directional_model.json")
     fpath = os.path.join(ARTIFACT_DIR, "flip_model.json")
-    if os.path.exists(dpath):
-        directional_model = xgb.XGBClassifier()
-        directional_model.load_model(dpath)
     if os.path.exists(fpath):
         flip_model = xgb.XGBClassifier()
         flip_model.load_model(fpath)
 
-    STATE["directional_model"] = directional_model
     STATE["flip_model"] = flip_model
     STATE["feature_cols"] = feature_cols
-    log.info(f"Models loaded: directional={directional_model is not None} flip={flip_model is not None}")
+    log.info(f"Models loaded: flip={flip_model is not None}")
 
 
 async def feed_loop():
@@ -404,6 +422,13 @@ async def kalshi_poll_loop():
                     KALSHI_STATE["yes_bid_cents"] = float(yes_bid) * 100.0
                 if yes_ask is not None:
                     KALSHI_STATE["yes_ask_cents"] = float(yes_ask) * 100.0
+
+                # Feed the rolling price history used for live momentum --
+                # mid price, same convention as kalshi_poller.py's stored
+                # yes_mid_cents (average of bid and ask).
+                if yes_bid is not None and yes_ask is not None:
+                    mid_cents = (float(yes_bid) + float(yes_ask)) * 100.0 / 2.0
+                    KALSHI_STATE["price_history"].add(time.time(), mid_cents)
         except Exception as e:
             log.warning(f"[serving/kalshi] poll error: {e}")
 
@@ -442,7 +467,6 @@ async def live():
         "current_price": feats.get("price"),
         "seconds_remaining": secs_remaining,
         "features": feats,
-        "directional": None,
         "flip": None,
         "mean_surge": None,
         "kraken": None,
@@ -461,6 +485,7 @@ async def live():
     if mean_surge is not None:
         result["mean_surge"] = mean_surge
 
+    kraken_feats = None
     kraken_buf = KRAKEN_STATE["buf"]
     if kraken_buf.ticks and KRAKEN_STATE["strike_price"] is not None:
         kraken_feats = compute_feature_snapshot(kraken_buf, KRAKEN_STATE["strike_price"], now_ts)
@@ -471,6 +496,7 @@ async def live():
             "features": kraken_feats,
         }
 
+    cryptocom_feats = None
     cryptocom_buf = CRYPTOCOM_STATE["buf"]
     if cryptocom_buf.ticks and CRYPTOCOM_STATE["strike_price"] is not None:
         cryptocom_feats = compute_feature_snapshot(cryptocom_buf, CRYPTOCOM_STATE["strike_price"], now_ts)
@@ -481,26 +507,47 @@ async def live():
             "features": cryptocom_feats,
         }
 
+    # Reversal model scoring only -- settlement/directional prediction was
+    # scrapped. build_live_feature_row() builds the prefixed + consensus
+    # column set; price-diff deviation and Kalshi momentum are computed
+    # separately (they need persistent rolling-history state, not just a
+    # snapshot) and merged in before scoring. Together these now cover
+    # every column train.py trained on, verified against real pandas
+    # ground truth for the rolling/momentum boundary conventions
+    # specifically (pandas uses TWO DIFFERENT window conventions across
+    # train.py -- .rolling() is exclusive-start, the momentum boolean
+    # filter is inclusive-both-ends -- confirmed empirically before
+    # shipping, not assumed). Any column still genuinely unavailable
+    # (e.g. too little history yet after a fresh restart) is left as NaN;
+    # XGBoost handles missing values natively rather than refusing to
+    # score at all, which is what the original all-or-nothing gate did.
     cols = STATE["feature_cols"]
-    if STATE["directional_model"] is not None and cols:
-        row = [[feats.get(c.replace("feat_", ""), None) for c in cols]]
-        try:
-            import numpy as np
-            X = np.array(row, dtype=float)
-            if not np.isnan(X).any():
-                p_up = float(STATE["directional_model"].predict_proba(X)[0, 1])
-                result["directional"] = {"p_up": p_up, "p_down": 1 - p_up}
-        except Exception as e:
-            result["directional"] = {"error": str(e)}
-
     if STATE["flip_model"] is not None and cols:
         try:
             import numpy as np
-            row = [[feats.get(c.replace("feat_", ""), None) for c in cols]]
+            row_dict = build_live_feature_row(
+                feats, kraken_feats, cryptocom_feats,
+                hour_of_day_utc=now.hour, day_of_week=now.weekday(),
+            )
+
+            price_diff_row = compute_price_diff_deviation_features(
+                PRICE_DIFF_STATE,
+                cb_price=feats.get("price"),
+                kr_price=kraken_feats.get("price") if kraken_feats else None,
+                cc_price=cryptocom_feats.get("price") if cryptocom_feats else None,
+                now_ts=now_ts,
+            )
+            row_dict.update(price_diff_row)
+
+            kalshi_momentum_row = compute_kalshi_momentum_features(
+                KALSHI_STATE["price_history"], now_ts,
+            )
+            row_dict.update(kalshi_momentum_row)
+
+            row = [[row_dict.get(c, np.nan) for c in cols]]
             X = np.array(row, dtype=float)
-            if not np.isnan(X).any():
-                p_reversal = float(STATE["flip_model"].predict_proba(X)[0, 1])
-                result["flip"] = {"p_flip": p_reversal}
+            p_reversal = float(STATE["flip_model"].predict_proba(X)[0, 1])
+            result["flip"] = {"p_flip": p_reversal}
         except Exception as e:
             result["flip"] = {"error": str(e)}
 

@@ -401,3 +401,171 @@ def compute_mean_surge_indicator(buf: RollingBuffer, strike_price: float, window
         "late_change": late_change,
         "signal": signal,
     }
+def build_live_feature_row(cb_feats: dict, kr_feats: dict | None, cc_feats: dict | None,
+                             hour_of_day_utc: int, day_of_week: int,
+                             kalshi_momentum: dict | None = None) -> dict:
+    """Builds ONE row of features matching train.py's exact column naming,
+    for live scoring -- the single-row equivalent of build_window_dataframe()
+    + add_consensus_features(). Exists specifically to prevent train/serve
+    skew (see compute.py's module docstring) -- confirmed this skew already
+    happened once: /live was still using pre-multi-exchange-rebuild column
+    names (unprefixed, e.g. "momentum_5s" instead of "cb_momentum_5s"),
+    silently producing an all-NaN row for every trained model -- loaded
+    successfully, scored nothing, no error surfaced anywhere.
+
+    NOTE: does NOT yet include price_diff_* (cross-exchange rolling gap
+    deviation) or kalshi_momentum_* columns unless explicitly passed in via
+    kalshi_momentum -- those need genuinely new rolling-history state (a
+    price-differential buffer, a Kalshi price history) that doesn't exist
+    in app.py yet. Those columns will simply be absent from the returned
+    dict; the caller should fill them with NaN rather than block scoring
+    entirely -- XGBoost handles missing values natively (it learns a
+    default split direction for them during training), so a partial row
+    still produces a valid, if less complete, prediction rather than none
+    at all. train.py's own docstring already flags this as a valid
+    approach, just not yet implemented.
+    """
+    row: dict = {}
+    exchange_feats = {"cb": cb_feats, "kr": kr_feats, "cc": cc_feats}
+
+    for prefix, feats in exchange_feats.items():
+        if not feats:
+            continue
+        for feat_name, value in feats.items():
+            if feat_name == "seconds_remaining":
+                continue  # not a model feature -- handled separately by the caller
+            row[f"{prefix}_{feat_name}"] = value
+
+    # Cross-exchange consensus -- must match train.py's add_consensus_features()
+    # EXACTLY (same metrics, same n_positive/n_negative/all_agree/mean/dispersion
+    # definitions), just computed from three scalar values instead of a
+    # dataframe column. Verified against train.py's real pandas output for a
+    # known mixed-sign test case before shipping.
+    for metric in ["book_imbalance", "imbalance_5", "imbalance_20", "imbalance_50"]:
+        vals = []
+        for feats in exchange_feats.values():
+            if feats is not None and feats.get(metric) is not None:
+                vals.append(feats[metric])
+
+        n_available = len(vals)
+        if n_available == 0:
+            continue
+
+        n_positive = sum(1 for v in vals if v > 0)
+        n_negative = sum(1 for v in vals if v < 0)
+        row[f"consensus_{metric}_n_positive"] = float(n_positive)
+        row[f"consensus_{metric}_n_negative"] = float(n_negative)
+
+        if n_available >= 2:
+            row[f"consensus_{metric}_all_agree"] = (
+                1.0 if (n_positive == n_available or n_negative == n_available) else 0.0
+            )
+        # else: leave absent (NaN) -- matches train.py's np.where(n_available >= 2, ..., np.nan)
+
+        mean = sum(vals) / n_available
+        row[f"consensus_{metric}_mean"] = mean
+
+        if n_available >= 2:
+            # sample variance (ddof=1), matching pandas' default .std() behavior
+            variance = sum((v - mean) ** 2 for v in vals) / (n_available - 1)
+            row[f"consensus_{metric}_dispersion"] = variance ** 0.5
+        # else: leave absent (NaN) -- matches pandas' .std() on a single value
+
+    row["hour_of_day_utc"] = float(hour_of_day_utc)
+    row["day_of_week"] = float(day_of_week)
+
+    if kalshi_momentum:
+        for k, v in kalshi_momentum.items():
+            if v is not None:
+                row[k] = v
+
+    return row
+@dataclass
+class RollingSeries:
+    """Generic bounded rolling history of (timestamp, value) pairs --
+    used for scalar state tracked over time that isn't a full Tick
+    (cross-exchange price gaps, Kalshi's own price). Bounded by
+    max_seconds so memory stays flat, same principle as RollingBuffer."""
+    max_seconds: float = 900.0
+    points: deque = field(default_factory=deque)
+
+    def add(self, ts: float, value: float) -> None:
+        self.points.append((ts, value))
+        cutoff = ts - self.max_seconds
+        while self.points and self.points[0][0] < cutoff:
+            self.points.popleft()
+
+    def _since_inclusive(self, seconds: float, now_ts: float) -> list[tuple[float, float]]:
+        """Both-ends-inclusive window: [now-seconds, now]. Matches
+        train.py's Kalshi momentum boundary (a plain boolean filter, NOT
+        .rolling()) -- verified empirically against real pandas output:
+        momentum_15s at t=20 over [5,50.5],[10,51.0],[15,50.8],[20,51.5]
+        gives 51.5-50.5=1.0, matching exactly."""
+        cutoff = now_ts - seconds
+        return [(t, v) for t, v in self.points if cutoff <= t <= now_ts]
+
+    def _since_exclusive_start(self, seconds: float, now_ts: float) -> list[tuple[float, float]]:
+        """Exclusive-start window: (now-seconds, now]. Matches pandas'
+        .rolling(f'{window}s') time-based convention used for the
+        price-diff deviation baseline -- verified empirically against
+        real pandas .rolling('30s', min_periods=3).mean() output (an
+        inclusive-start assumption gives the WRONG answer here; pandas'
+        actual window at t=70 over a 30s span is (40,70], not [40,70])."""
+        cutoff = now_ts - seconds
+        return [(t, v) for t, v in self.points if t > cutoff]
+
+    def rolling_mean(self, seconds: float, now_ts: float, min_periods: int = 3) -> float | None:
+        vals = [v for t, v in self._since_exclusive_start(seconds, now_ts)]
+        if len(vals) < min_periods:
+            return None
+        return sum(vals) / len(vals)
+
+    def momentum(self, seconds: float, now_ts: float) -> float | None:
+        pts = self._since_inclusive(seconds, now_ts)
+        if len(pts) < 2:
+            return None
+        return pts[-1][1] - pts[0][1]
+
+
+def compute_price_diff_deviation_features(diff_series_dict: dict, cb_price: float | None,
+                                            kr_price: float | None, cc_price: float | None,
+                                            now_ts: float,
+                                            baseline_secs: tuple = (30.0, 60.0, 120.0)) -> dict:
+    """Live equivalent of train.py's add_price_differential_features().
+    Updates each pair's rolling gap history with the CURRENT gap, then
+    computes deviation-from-rolling-baseline. diff_series_dict must be
+    owned by the CALLER as persistent state (e.g. module-level in app.py)
+    across repeated calls -- this is what lets the rolling history
+    actually accumulate over time rather than resetting every call."""
+    row = {}
+    pairs = {"cc_cb": (cc_price, cb_price), "kr_cb": (kr_price, cb_price)}
+    for pair_name, (other_price, base_price) in pairs.items():
+        if other_price is None or base_price is None:
+            continue
+        gap = other_price - base_price
+        series = diff_series_dict[pair_name]
+        series.add(now_ts, gap)
+
+        other, base = pair_name.split("_")
+        diff_col = f"price_diff_{other}_{base}"
+        row[diff_col] = gap
+        for window in baseline_secs:
+            rolling_mean = series.rolling_mean(window, now_ts, min_periods=3)
+            if rolling_mean is not None:
+                row[f"{diff_col}_deviation_{int(window)}s"] = gap - rolling_mean
+    return row
+
+
+def compute_kalshi_momentum_features(kalshi_series: RollingSeries, now_ts: float,
+                                       lookbacks: dict | None = None) -> dict:
+    """Live equivalent of train.py's _kalshi_ticks_to_momentum_df().
+    kalshi_series must be owned by the CALLER as persistent state, updated
+    every time a new Kalshi price is observed (e.g. in kalshi_poll_loop)."""
+    if lookbacks is None:
+        lookbacks = {"kalshi_momentum_15s": 15.0, "kalshi_momentum_60s": 60.0}
+    row = {}
+    for col_name, lookback in lookbacks.items():
+        m = kalshi_series.momentum(lookback, now_ts)
+        if m is not None:
+            row[col_name] = m
+    return row
