@@ -44,9 +44,13 @@ there isn't enough data yet.
 """
 from __future__ import annotations
 import os
+import re
 import sys
+import gc
 import json
+import shutil
 import logging
+import tempfile
 from datetime import datetime
 
 import numpy as np
@@ -430,6 +434,13 @@ def add_consensus_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _safe_cache_filename(window_id: str) -> str:
+    """Sanitizes a window_id (e.g. '2026-08-19T05:45:00+00:00') into a
+    safe filename -- avoids relying on colons/plus signs being legal in
+    the filesystem, and sidesteps any shell-escaping surprises."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", window_id) + ".pkl"
+
+
 def load_dataset() -> pd.DataFrame:
     windows = list_closed_windows(region_name=REGION)
     windows = [w for w in windows if w.get("source") != "backfill"]
@@ -443,30 +454,72 @@ def load_dataset() -> pd.DataFrame:
         sys.exit(0)
 
     windows = sorted(windows, key=lambda w: w["window_id"])
-    all_dfs = []
+
+    # Stream each window's dataframe to disk immediately after building it,
+    # rather than accumulating every window's full dataframe in a Python
+    # list before one final concat -- with 1000+ windows across three
+    # exchanges, holding everything in memory simultaneously exhausted this
+    # box's RAM (confirmed directly: a real run had to be killed manually
+    # after climbing past 1.7GB of swap and threatening to take the live
+    # serving process down with it via the OOM killer). Peak memory is now
+    # bounded by roughly ONE window's processing overhead at a time, plus
+    # the final combined dataset read back from disk -- not the sum of
+    # every window's overhead held alive at once.
+    #
+    # Uses pandas' built-in pickle format rather than Parquet specifically
+    # so this doesn't introduce a new dependency (pyarrow) that may not be
+    # installed on the box -- pickle round-trips pandas dtypes/NaNs exactly
+    # and needs nothing beyond pandas itself.
+    cache_dir = tempfile.mkdtemp(prefix="train_window_cache_")
+    log.info(f"Streaming per-window dataframes to {cache_dir} to bound peak memory")
+
     total_dropped_pre_cutoff = 0
-    for w in windows:
-        wid = w["window_id"]
-        # Prefer Kalshi's own authoritative settlement result (written by
-        # kalshi_settlement_reconciliation.py) over our own Coinbase-TWAP
-        # approximation whenever it's available -- Kalshi's real outcome
-        # is ground truth, our own calculation is only an approximation
-        # of it. Falls back to our own outcome for windows that haven't
-        # been reconciled yet (e.g. very recent ones, or if the
-        # reconciliation script hasn't been run since).
-        true_outcome = w.get("kalshi_true_outcome")
-        outcome_up = 1 if (true_outcome or w.get("outcome")) == "up" else 0
-        flip_occurred = bool(w.get("flip_occurred", False))
-        window_df = build_window_dataframe(wid, outcome_up, flip_occurred, region=REGION)
-        if window_df is not None:
-            total_dropped_pre_cutoff += window_df.attrs.get("rows_dropped_pre_cutoff", 0)
-            all_dfs.append(window_df)
+    windows_written = 0
+    try:
+        for idx, w in enumerate(windows):
+            wid = w["window_id"]
+            # Prefer Kalshi's own authoritative settlement result (written
+            # by kalshi_settlement_reconciliation.py) over our own
+            # Coinbase-TWAP approximation whenever it's available --
+            # Kalshi's real outcome is ground truth, our own calculation
+            # is only an approximation of it. Falls back to our own
+            # outcome for windows that haven't been reconciled yet.
+            true_outcome = w.get("kalshi_true_outcome")
+            outcome_up = 1 if (true_outcome or w.get("outcome")) == "up" else 0
+            flip_occurred = bool(w.get("flip_occurred", False))
+            window_df = build_window_dataframe(wid, outcome_up, flip_occurred, region=REGION)
 
-    if not all_dfs:
-        log.warning("No usable windows with tick data found. Exiting.")
-        sys.exit(0)
+            if window_df is not None and len(window_df) > 0:
+                total_dropped_pre_cutoff += window_df.attrs.get("rows_dropped_pre_cutoff", 0)
+                out_path = os.path.join(cache_dir, _safe_cache_filename(wid))
+                window_df.to_pickle(out_path)
+                windows_written += 1
 
-    df = pd.concat(all_dfs, ignore_index=True)
+            del window_df  # prompt release of this window's processing overhead
+                             # before starting the next one, rather than letting
+                             # it linger alongside everything still to come
+
+            # Periodic explicit GC -- doesn't force numpy/pandas' underlying
+            # C allocators to hand memory back to the OS (they typically
+            # retain freed blocks for reuse rather than releasing them), so
+            # this won't necessarily show up as falling RSS in `free -h`.
+            # What it DOES do is catch reference cycles that pure
+            # refcounting can miss, keeping peak growth bounded rather than
+            # silently accumulating over a run spanning 1000+ windows.
+            if idx % 50 == 0:
+                gc.collect()
+
+        if windows_written == 0:
+            log.warning("No usable windows with tick data found. Exiting.")
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            sys.exit(0)
+
+        log.info(f"Wrote {windows_written} window dataframes to disk; reading back for training...")
+        cached_files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".pkl")]
+        df = pd.concat([pd.read_pickle(f) for f in cached_files], ignore_index=True)
+    finally:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
     log.info(f"Built dataset: {len(df)} rows across {df['window_id'].nunique()} windows")
     if total_dropped_pre_cutoff > 0:
         cutoff_dt = datetime.utcfromtimestamp(ORDER_BOOK_FIX_CUTOFF_TS).isoformat() + "Z"
