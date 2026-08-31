@@ -117,6 +117,31 @@ KALSHI_MERGE_TOLERANCE_SEC = 20.0  # Kalshi's own API caches responses for 15s s
                                      # (confirmed via kalshi_polling_diagnostic.py) -- a tick
                                      # older than that is genuinely stale, not just missing
 
+# Strike-cross label config: "does Coinbase's price actually cross the
+# window's strike at any point BEFORE THE WINDOW CLOSES" -- the most
+# directly trade-relevant of the three trained questions, since crossing
+# the strike is literally the event that flips which side of the Kalshi
+# contract wins. Distinct from BOTH the (scrapped) directional/settlement
+# model (which asked where price would SETTLE) and the reversal model
+# (which asks whether MOMENTUM reverses, with no notion of the strike at
+# all).
+#
+# No fixed forward horizon (e.g. "within the next 45s") -- "before close"
+# uses the window's own natural endpoint instead of guessing at how long a
+# crossing takes to develop. Real-world observation: crossings are rare on
+# a scale of seconds and typically take a few minutes, so an arbitrary
+# fixed horizon risks either missing genuine crossings (too short) or
+# needing constant re-tuning (too long, or the wrong length for different
+# market conditions). Also detects a crossing even if price later flips
+# BACK before close -- "did it ever cross," not just "which side does it
+# end up on."
+#
+# Needs no new stored data: the sign of the already-stored
+# cb_log_return_from_strike column IS which side of the strike price is
+# on (positive = above, negative = below), so a crossing is exactly a
+# sign flip of that column at any point between now and the window's last
+# row -- no separate numeric strike value needs to be threaded through.
+
 # Before this timestamp, all three exchanges' ingestion services logged
 # ticks ONLY when a trade fired -- book-only movement between trades (the
 # actual mechanism behind several patterns discussed: Coinbase's book
@@ -329,6 +354,54 @@ def compute_reversal_labels(grid_df: pd.DataFrame, kalshi_price_df: pd.DataFrame
     return label
 
 
+def compute_strike_cross_labels(grid_df: pd.DataFrame) -> pd.Series:
+    """For each row in grid_df (must already have 'cb_log_return_from_strike'),
+    determines whether Coinbase's price crosses the window's strike at ANY
+    point between now and the window's close -- not a fixed forward
+    horizon. Detects a crossing even if price later flips back before
+    close ("did it ever cross," not just "which side does it end up on").
+
+    Computed via a reverse-cumulative min/max of cb_log_return_from_strike
+    from each row through the end of the window: if currently above the
+    strike (positive), a crossing happens iff the value ever goes negative
+    somewhere between now and close (forward min < 0); if currently below
+    (negative), iff it ever goes positive (forward max > 0). No horizon or
+    tolerance parameter needed -- "before close" IS the horizon, using the
+    window's own natural endpoint. Since grid_df is built one window at a
+    time (see build_window_dataframe), this naturally never leaks into a
+    different window's data.
+
+      1 = crosses the strike at some point before close
+      0 = stays on the same side all the way to close (including the
+          trivial last row, which has no more time left to flip)
+      NaN = current value is exactly 0 (on the strike itself -- ambiguous
+          starting side, vanishingly rare with continuous prices)
+
+    Verified against a hand-traced dip-and-recover sequence before
+    shipping -- correctly flags a crossing even when price flips back to
+    its original side before close, not just checking the final value."""
+    n = len(grid_df)
+    if "cb_log_return_from_strike" not in grid_df.columns:
+        return pd.Series([np.nan] * n, index=grid_df.index)
+
+    vals = grid_df["cb_log_return_from_strike"].reset_index(drop=True).to_numpy()
+    current_side = np.sign(vals)
+
+    forward_min = np.minimum.accumulate(vals[::-1])[::-1]
+    forward_max = np.maximum.accumulate(vals[::-1])[::-1]
+
+    label = pd.Series([np.nan] * n)
+    above_now = current_side > 0
+    below_now = current_side < 0
+
+    label[(above_now & (forward_min < 0))] = 1
+    label[(above_now & (forward_min >= 0))] = 0
+    label[(below_now & (forward_max > 0))] = 1
+    label[(below_now & (forward_max <= 0))] = 0
+    label.index = grid_df.index
+    return label
+
+
 def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool, region: str = REGION) -> pd.DataFrame | None:
     cb_ticks = get_generic_window_ticks("btc_ticks", window_id, region)
     cb_df = _ticks_to_feature_df(cb_ticks, "cb")
@@ -371,6 +444,13 @@ def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool,
     # before an expected flip, since it's the same underlying question.
     kalshi_price_df = _kalshi_ticks_to_price_df(kalshi_ticks)
     merged["label_reversal"] = compute_reversal_labels(merged, kalshi_price_df)
+
+    # "Does price actually cross the strike within the next horizon" --
+    # the most directly trade-relevant of the three trained questions.
+    # Computed from cb_log_return_from_strike's sign alone (see
+    # compute_strike_cross_labels docstring) -- needs cb_ prefixed columns
+    # to already exist in merged, which they do by this point.
+    merged["label_strike_cross"] = compute_strike_cross_labels(merged)
 
     # Raw time-of-day/day-of-week -- NOT assuming which hours are "high
     # volatility"/"institutional" a priori. Letting the model (and separate
@@ -593,48 +673,6 @@ def walk_forward_splits(df: pd.DataFrame, n_splits: int = 4):
         yield train_df, test_df
 
 
-def train_directional_model(df: pd.DataFrame):
-    X_cols = [c for c in FEATURE_COLS if c in df.columns]
-    df = df.dropna(subset=X_cols + ["label_up"])
-    log.info(f"[Directional] {len(df)} rows remain after dropping incomplete cross-exchange rows")
-
-    aucs, briers = [], []
-    for train_df, test_df in walk_forward_splits(df):
-        if train_df.empty or test_df.empty:
-            continue
-        model = xgb.XGBClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
-        )
-        model.fit(train_df[X_cols], train_df["label_up"])
-        preds = model.predict_proba(test_df[X_cols])[:, 1]
-        if test_df["label_up"].nunique() > 1:
-            aucs.append(roc_auc_score(test_df["label_up"], preds))
-        briers.append(brier_score_loss(test_df["label_up"], preds))
-
-    log.info(f"[Directional] walk-forward AUC: {np.mean(aucs):.4f} | Brier: {np.mean(briers):.4f}")
-    log.info("Brier score is the one that matters for EV math -- lower is better "
-              "calibrated. AUC alone can look fine while probabilities are still miscalibrated.")
-
-    final_model = xgb.XGBClassifier(
-        n_estimators=200, max_depth=4, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
-    )
-    final_model.fit(df[X_cols], df["label_up"])
-
-    importances = dict(zip(X_cols, final_model.feature_importances_.tolist()))
-    sorted_importances = dict(sorted(importances.items(), key=lambda x: -x[1])[:15])
-    log.info("Top 15 feature importances:")
-    for k, v in sorted_importances.items():
-        log.info(f"  {k}: {v:.4f}")
-
-    return final_model, {
-        "auc": float(np.mean(aucs)) if aucs else None,
-        "brier": float(np.mean(briers)),
-        "top_feature_importances": sorted_importances,
-    }
-
-
 def train_reversal_model(df: pd.DataFrame):
     """Replaces the old settlement-only flip model. Trained on ALL rows
     across the entire window (no seconds_remaining filter), predicting
@@ -681,23 +719,88 @@ def train_reversal_model(df: pd.DataFrame):
     return final_model, {"auc": float(np.mean(aucs)) if aucs else None, "brier": float(np.mean(briers))}
 
 
-def save_artifacts(directional_model, reversal_model, metrics: dict, feature_cols: list[str]):
+def train_strike_cross_model(df: pd.DataFrame):
+    """The most directly trade-relevant of the three trained questions:
+    does price actually cross the window's strike within the next
+    horizon_seconds, checked continuously throughout the window (same
+    usability pattern as the reversal model -- not settlement-only).
+
+    Strike crossings are plausibly rarer than reversals (a reversal is
+    just a momentum wobble; a crossing is a bigger move), so class balance
+    is checked explicitly and scale_pos_weight applied if warranted --
+    unlike the reversal model, which didn't need this in practice."""
+    X_cols = [c for c in FEATURE_COLS if c in df.columns]
+    df = df.dropna(subset=X_cols + ["label_strike_cross"])
+    log.info(f"[StrikeCross] {len(df)} rows remain after dropping rows with no clear "
+              f"current side or missing forward Coinbase data")
+
+    if df["window_id"].nunique() < 20:
+        log.warning("Not enough rows with a usable strike-cross label yet. Skipping.")
+        return None, {}
+
+    pos_rate = df["label_strike_cross"].mean()
+    n_pos = int(df["label_strike_cross"].sum())
+    n_neg = len(df) - n_pos
+    scale_pos_weight = (n_neg / n_pos) if n_pos > 0 else 1.0
+    log.info(f"[StrikeCross] label balance: {pos_rate*100:.2f}% positive "
+              f"(n_pos={n_pos}, n_neg={n_neg}), scale_pos_weight={scale_pos_weight:.2f}")
+
+    aucs, briers = [], []
+    for train_df, test_df in walk_forward_splits(df, n_splits=3):
+        if train_df.empty or test_df.empty:
+            continue
+        model = xgb.XGBClassifier(
+            n_estimators=150, max_depth=3, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
+            scale_pos_weight=scale_pos_weight,
+        )
+        model.fit(train_df[X_cols], train_df["label_strike_cross"])
+        preds = model.predict_proba(test_df[X_cols])[:, 1]
+        if test_df["label_strike_cross"].nunique() > 1:
+            aucs.append(roc_auc_score(test_df["label_strike_cross"], preds))
+        briers.append(brier_score_loss(test_df["label_strike_cross"], preds))
+
+    log.info(f"[StrikeCross] walk-forward AUC: {np.mean(aucs) if aucs else float('nan'):.4f} | "
+              f"Brier: {np.mean(briers):.4f}")
+
+    final_model = xgb.XGBClassifier(
+        n_estimators=150, max_depth=3, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
+        scale_pos_weight=scale_pos_weight,
+    )
+    final_model.fit(df[X_cols], df["label_strike_cross"])
+    return final_model, {
+        "auc": float(np.mean(aucs)) if aucs else None,
+        "brier": float(np.mean(briers)),
+        "pos_rate": float(pos_rate),
+        "scale_pos_weight": float(scale_pos_weight),
+    }
+
+
+def save_artifacts(reversal_model, strike_cross_model, metrics: dict, feature_cols: list[str]):
+    """NOTE: directional/settlement model intentionally no longer trained
+    or saved -- scrapped in favor of focusing on reversal and (now)
+    strike-crossing, both of which ask more directly trade-relevant
+    questions than "where will price settle"."""
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
-    directional_model.save_model(os.path.join(ARTIFACT_DIR, "directional_model.json"))
     if reversal_model is not None:
         reversal_model.save_model(os.path.join(ARTIFACT_DIR, "flip_model.json"))
+    if strike_cross_model is not None:
+        strike_cross_model.save_model(os.path.join(ARTIFACT_DIR, "strike_cross_model.json"))
     with open(os.path.join(ARTIFACT_DIR, "metadata.json"), "w") as f:
         json.dump({
             "trained_at": datetime.utcnow().isoformat(),
             "feature_cols": feature_cols,
             "metrics": metrics,
-            "note": "flip_model.json now holds the general-purpose reversal model "
-                    "(usable at any point in the window), not the old settlement-only flip model.",
+            "note": "flip_model.json holds the general-purpose reversal model (usable at "
+                    "any point in the window). strike_cross_model.json predicts whether "
+                    "price actually crosses the strike within the next horizon -- the "
+                    "settlement/directional model was scrapped entirely.",
         }, f, indent=2)
 
     try:
         s3 = boto3.client("s3", region_name=REGION)
-        for fname in ["directional_model.json", "flip_model.json", "metadata.json"]:
+        for fname in ["flip_model.json", "strike_cross_model.json", "metadata.json"]:
             local_path = os.path.join(ARTIFACT_DIR, fname)
             if os.path.exists(local_path):
                 s3.upload_file(local_path, S3_BUCKET, f"models/{fname}")
@@ -708,10 +811,10 @@ def save_artifacts(directional_model, reversal_model, metrics: dict, feature_col
 
 def main():
     df = load_dataset()
-    directional_model, dir_metrics = train_directional_model(df)
     reversal_model, reversal_metrics = train_reversal_model(df)
-    save_artifacts(directional_model, reversal_model,
-                    {"directional": dir_metrics, "reversal": reversal_metrics},
+    strike_cross_model, strike_cross_metrics = train_strike_cross_model(df)
+    save_artifacts(reversal_model, strike_cross_model,
+                    {"reversal": reversal_metrics, "strike_cross": strike_cross_metrics},
                     [c for c in FEATURE_COLS if c in df.columns])
     log.info("Training complete.")
 
