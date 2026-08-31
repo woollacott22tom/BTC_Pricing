@@ -103,6 +103,7 @@ STATE = {
     "window_id": None,
     "strike_price": None,
     "flip_model": None,
+    "strike_cross_model": None,
     "feature_cols": [],
 }
 
@@ -151,10 +152,9 @@ PRICE_DIFF_STATE = {
 
 def load_models():
     """NOTE: directional model intentionally not loaded/served anymore --
-    settlement prediction was scrapped in favor of focusing on the
-    reversal model. flip_model.json (the general-purpose reversal model,
-    not the old settlement-only flip predictor) is the only model this
-    endpoint scores against now."""
+    settlement prediction was scrapped in favor of reversal and
+    strike-crossing, both of which ask more directly trade-relevant
+    questions than "where will price settle"."""
     feature_cols = []
     if os.path.exists(FEATURE_COLS_PATH):
         with open(FEATURE_COLS_PATH) as f:
@@ -166,9 +166,16 @@ def load_models():
         flip_model = xgb.XGBClassifier()
         flip_model.load_model(fpath)
 
+    strike_cross_model = None
+    scpath = os.path.join(ARTIFACT_DIR, "strike_cross_model.json")
+    if os.path.exists(scpath):
+        strike_cross_model = xgb.XGBClassifier()
+        strike_cross_model.load_model(scpath)
+
     STATE["flip_model"] = flip_model
+    STATE["strike_cross_model"] = strike_cross_model
     STATE["feature_cols"] = feature_cols
-    log.info(f"Models loaded: flip={flip_model is not None}")
+    log.info(f"Models loaded: flip={flip_model is not None} strike_cross={strike_cross_model is not None}")
 
 
 async def feed_loop():
@@ -468,6 +475,7 @@ async def live():
         "seconds_remaining": secs_remaining,
         "features": feats,
         "flip": None,
+        "strike_cross": None,
         "mean_surge": None,
         "kraken": None,
         "kalshi_strike": KALSHI_STATE["strike"],
@@ -507,11 +515,14 @@ async def live():
             "features": cryptocom_feats,
         }
 
-    # Reversal model scoring only -- settlement/directional prediction was
-    # scrapped. build_live_feature_row() builds the prefixed + consensus
-    # column set; price-diff deviation and Kalshi momentum are computed
-    # separately (they need persistent rolling-history state, not just a
-    # snapshot) and merged in before scoring. Together these now cover
+    # Row-building done ONCE, reused for both models below. Important:
+    # compute_price_diff_deviation_features() has a side effect -- it
+    # appends the current gap to persistent rolling-history state on every
+    # call. Calling it separately per model would double-count the same
+    # tick into that history, corrupting the rolling mean. build_live_feature_row()
+    # builds the prefixed + consensus column set; price-diff deviation and
+    # Kalshi momentum need persistent rolling-history state (not just a
+    # snapshot), computed separately and merged in. Together these cover
     # every column train.py trained on, verified against real pandas
     # ground truth for the rolling/momentum boundary conventions
     # specifically (pandas uses TWO DIFFERENT window conventions across
@@ -522,7 +533,7 @@ async def live():
     # XGBoost handles missing values natively rather than refusing to
     # score at all, which is what the original all-or-nothing gate did.
     cols = STATE["feature_cols"]
-    if STATE["flip_model"] is not None and cols:
+    if cols and (STATE["flip_model"] is not None or STATE["strike_cross_model"] is not None):
         try:
             import numpy as np
             row_dict = build_live_feature_row(
@@ -546,9 +557,21 @@ async def live():
 
             row = [[row_dict.get(c, np.nan) for c in cols]]
             X = np.array(row, dtype=float)
-            p_reversal = float(STATE["flip_model"].predict_proba(X)[0, 1])
-            result["flip"] = {"p_flip": p_reversal}
+
+            if STATE["flip_model"] is not None:
+                try:
+                    p_reversal = float(STATE["flip_model"].predict_proba(X)[0, 1])
+                    result["flip"] = {"p_flip": p_reversal}
+                except Exception as e:
+                    result["flip"] = {"error": str(e)}
+
+            if STATE["strike_cross_model"] is not None:
+                try:
+                    p_cross = float(STATE["strike_cross_model"].predict_proba(X)[0, 1])
+                    result["strike_cross"] = {"p_cross": p_cross}
+                except Exception as e:
+                    result["strike_cross"] = {"error": str(e)}
         except Exception as e:
-            result["flip"] = {"error": str(e)}
+            log.warning(f"[serving] feature-row build failed: {e}")
 
     return result
