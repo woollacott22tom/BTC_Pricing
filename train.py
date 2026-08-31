@@ -483,7 +483,13 @@ def load_dataset() -> pd.DataFrame:
     # back up. Safe to manually clear this directory (rm -rf) if you ever
     # want a guaranteed fully-fresh rebuild, e.g. after changing
     # FEATURE_COLS in a way that would make old cached rows stale.
-    cache_dir = "/home/ec2-user/train_window_cache"
+    # Configurable via TRAIN_CACHE_DIR so the same script works unmodified
+    # on the EC2 box (default) or anywhere else with real disk and AWS
+    # credentials -- e.g. Colab, which offers far more RAM (~12GB+ on the
+    # free tier vs. this box's 916MB) for exactly the kind of heavy batch
+    # job training is, without risking the always-on live services that
+    # share the EC2 box.
+    cache_dir = os.environ.get("TRAIN_CACHE_DIR", "/home/ec2-user/train_window_cache")
     os.makedirs(cache_dir, exist_ok=True)
     log.info(f"Using persistent window cache at {cache_dir} (enables resuming an interrupted run)")
 
