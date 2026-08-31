@@ -213,6 +213,45 @@
     line-height: 1.5;
   }
 
+  .models-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+
+  .panel-compact {
+    padding: 14px 6px;
+    text-align: center;
+    margin-bottom: 0;
+  }
+
+  .panel-title-compact {
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .flip-value-compact {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--down);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .flip-caption-compact {
+    font-size: 8px;
+    color: var(--text-dim);
+    line-height: 1.3;
+    margin-top: 6px;
+  }
+
   .feature-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -264,22 +303,22 @@
     <div class="status-text"><span class="conn-dot" id="connDot"></span><span id="connText">connecting</span></div>
   </header>
 
-  <div class="panel flip-panel" id="flipPanel">
-    <div class="panel-title"><span>Reversal Probability</span></div>
-    <div class="flip-value" id="flipValue">—</div>
-    <div class="flip-caption">Estimated probability price reverses against its current trend in the next ~45 seconds.</div>
-  </div>
+  <div class="models-row">
+    <div class="panel flip-panel panel-compact" id="flipPanel">
+      <div class="panel-title-compact">Reversal</div>
+      <div class="flip-value-compact" id="flipValue">—</div>
+    </div>
 
-  <div class="panel flip-panel" id="strikeCrossPanel">
-    <div class="panel-title"><span>Strike-Cross Probability</span></div>
-    <div class="flip-value" id="strikeCrossValue">—</div>
-    <div class="flip-caption">Estimated probability price crosses the strike at some point before this window closes.</div>
-  </div>
+    <div class="panel flip-panel panel-compact" id="strikeCrossPanel">
+      <div class="panel-title-compact">Cross</div>
+      <div class="flip-value-compact" id="strikeCrossValue">—</div>
+    </div>
 
-  <div class="panel flip-panel" id="meanSurgePanel">
-    <div class="panel-title"><span>Mean/Surge Signal</span></div>
-    <div class="flip-value" id="meanSurgeValue">—</div>
-    <div class="flip-caption" id="meanSurgeCaption">Mean price position vs strike, reinforced or offset by the last 2 minutes' move.</div>
+    <div class="panel flip-panel panel-compact" id="meanSurgePanel">
+      <div class="panel-title-compact">Mean/Surge</div>
+      <div class="flip-value-compact" id="meanSurgeValue">—</div>
+      <div class="flip-caption-compact" id="meanSurgeCaption"></div>
+    </div>
   </div>
 
   <div class="countdown-row">
