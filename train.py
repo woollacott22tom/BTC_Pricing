@@ -470,7 +470,13 @@ def load_dataset() -> pd.DataFrame:
     # so this doesn't introduce a new dependency (pyarrow) that may not be
     # installed on the box -- pickle round-trips pandas dtypes/NaNs exactly
     # and needs nothing beyond pandas itself.
-    cache_dir = tempfile.mkdtemp(prefix="train_window_cache_")
+    # NOTE: explicitly NOT using the default /tmp -- confirmed via `mount`
+    # that /tmp on this box is tmpfs (RAM-backed), capped at ~460MB. Writing
+    # the per-window cache there would have hit that ceiling before ever
+    # threatening the real memory limit, defeating the whole point of
+    # streaming to disk. The root filesystem (/dev/nvme0n1p1) is real EBS
+    # storage with ~21GB free -- genuinely off-heap, not memory in disguise.
+    cache_dir = tempfile.mkdtemp(prefix="train_window_cache_", dir="/home/ec2-user")
     log.info(f"Streaming per-window dataframes to {cache_dir} to bound peak memory")
 
     total_dropped_pre_cutoff = 0
