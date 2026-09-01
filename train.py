@@ -67,6 +67,13 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 S3_BUCKET = os.environ.get("MODEL_BUCKET", "btc-kalshi-model-artifacts")
 ARTIFACT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "artifacts")
 MIN_WINDOWS_REQUIRED = 200
+
+# Bump this whenever label or feature COMPUTATION LOGIC changes, even if
+# column NAMES stay the same -- protects the resume cache from silently
+# serving stale-logic rows. Confirmed this exact failure mode happened
+# twice already with label_reversal (Kalshi-odds -> window-scoped ->
+# pure real-price momentum), always under the same column name.
+FEATURE_SCHEMA_VERSION = 3
 CROSS_EXCHANGE_MERGE_TOLERANCE_SEC = 20.0
 
 BASE_FEATURES = [
@@ -105,14 +112,13 @@ KALSHI_MOMENTUM_LOOKBACKS = {"kalshi_momentum_15s": 15.0, "kalshi_momentum_60s":
 FEATURE_COLS = FEATURE_COLS + list(KALSHI_MOMENTUM_LOOKBACKS.keys())
 FEATURE_COLS = FEATURE_COLS + ["hour_of_day_utc", "day_of_week"]
 
-# Reversal label config: "is Kalshi's price about to reverse against its
-# current trend, at ANY point in the window" -- not the old settlement-
-# specific flip concept (window-level, final-60s-only). This is the same
-# underlying question asked continuously throughout the window, usable for
-# both entry (imminent trend forming) and exit (imminent trend breaking)
-# decisions. See train_reversal_model() and compute_reversal_labels().
-REVERSAL_HORIZON_SEC = 45.0  # matches the horizon validated against Kalshi's 15s API cache
-REVERSAL_THRESHOLD_CENTS = 3.0  # minimum forward move to count as a genuine reversal, not noise
+# Reversal label config: a pure, continuous real-price momentum/flip
+# detector -- NOT tied to Kalshi's odds, the window's strike, the
+# settlement period, or the 15-minute window boundary in any way. See
+# compute_reversal_labels() for the full multi-bucket shape/magnitude/
+# majority definition (REVERSAL_HORIZON_SEC below is no longer used by
+# it -- kept only in case something else still references it).
+REVERSAL_HORIZON_SEC = 45.0
 KALSHI_MERGE_TOLERANCE_SEC = 20.0  # Kalshi's own API caches responses for 15s server-side
                                      # (confirmed via kalshi_polling_diagnostic.py) -- a tick
                                      # older than that is genuinely stale, not just missing
@@ -281,75 +287,147 @@ def _kalshi_ticks_to_momentum_df(kalshi_ticks: list[dict]) -> pd.DataFrame | Non
     return df[["timestamp"] + list(KALSHI_MOMENTUM_LOOKBACKS.keys())]
 
 
-def _kalshi_ticks_to_price_df(kalshi_ticks: list[dict]) -> pd.DataFrame | None:
-    """Raw Kalshi price series (NOT momentum) -- used only for computing
-    the forward-looking reversal LABEL. Labels are allowed to look into
-    the future (that's what makes them a trainable target); this must
-    stay completely separate from the momentum FEATURE computation above,
-    which must never see the future."""
-    if not kalshi_ticks:
-        return None
-    rows = []
-    for t in kalshi_ticks:
-        if "yes_mid_cents" not in t or t["yes_mid_cents"] is None:
-            continue
-        rows.append({"timestamp": float(t["timestamp"]), "yes_mid_cents": float(t["yes_mid_cents"])})
-    if len(rows) < 2:
-        return None
-    return pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
+def _rolling_mean_lookup(grid_df: pd.DataFrame, roll_series: pd.Series, offset_seconds: float,
+                           tolerance_seconds: float = 10.0) -> pd.Series:
+    """Looks up roll_series' value at (row's own timestamp + offset_seconds)
+    for every row, via merge_asof. offset_seconds can be negative (backward
+    -- safe for a feature) or positive (forward -- only used for LABELS
+    here, never a feature, since features must never see the future)."""
+    lookup = grid_df[["timestamp"]].copy()
+    lookup["target_ts"] = lookup["timestamp"] + offset_seconds
+    lookup = lookup.sort_values("target_ts")
+
+    source = pd.DataFrame({
+        "timestamp": grid_df["timestamp"].reset_index(drop=True),
+        "value": roll_series.reset_index(drop=True),
+    }).sort_values("timestamp")
+
+    result = pd.merge_asof(
+        lookup.rename(columns={"timestamp": "orig_ts", "target_ts": "timestamp"}),
+        source, on="timestamp", direction="backward", tolerance=tolerance_seconds,
+    )
+    result = result.sort_values("orig_ts").reset_index(drop=True)
+    result.index = grid_df.index
+    return result["value"]
 
 
-def compute_reversal_labels(grid_df: pd.DataFrame, kalshi_price_df: pd.DataFrame | None,
-                             horizon_seconds: float = REVERSAL_HORIZON_SEC,
-                             threshold_cents: float = REVERSAL_THRESHOLD_CENTS,
-                             tolerance_seconds: float = KALSHI_MERGE_TOLERANCE_SEC) -> pd.Series:
-    """For each row in grid_df (must already have 'timestamp' and
-    'kalshi_momentum_15s' columns), determines whether Kalshi's price
-    REVERSES against its current trailing direction within the next
-    horizon_seconds, by at least threshold_cents.
+def compute_reversal_labels(grid_df: pd.DataFrame, bucket_seconds: float = 15.0,
+                             min_trend_dollars: float = 1.0,
+                             tolerance_seconds: float = 10.0) -> pd.Series:
+    """Multi-bucket shape+magnitude+majority reversal detector, using ONLY
+    Coinbase's own real price (cb_price) -- no strike, no settlement
+    window, no Kalshi anywhere.
 
-      1 = genuine reversal (price moved the OPPOSITE way from the current
-          trend, by more than the noise threshold)
-      0 = no reversal (price continued the same direction, or moved by
-          less than the threshold either way)
-      NaN = excluded -- either there's no clear existing trend to reverse
-          FROM (momentum ~0), or forward data isn't available within
-          tolerance (e.g. near the very end of the window)
+    For each row at time t, defines four consecutive 15s BACKWARD bucket
+    means (B1 nearest t .. B4 farthest) and four consecutive 15s FORWARD
+    bucket means (X1 nearest t .. X4 farthest), all computed from a single
+    rolling 15s mean of cb_price plus time-shifted lookups against it --
+    the same merge_asof technique already used and validated elsewhere in
+    this file, just applied 7 times instead of once.
 
-    Uses the SAME vectorized merge_asof technique as everything else here,
-    just with a FORWARD-looking target this time -- fine for a label,
-    which is explicitly the case for a supervised training TARGET, as
-    opposed to a feature (which must never see the future)."""
+    ESTABLISHED TREND (backward): the delta spanning the 30-60s-before-t
+    range (B3-B4, the earliest/leading transition) must be the LARGEST in
+    magnitude among the three consecutive backward deltas, and at least
+    $min_trend_dollars -- meaning the real move happened 30-60s before t
+    and has been leveling off approaching t (t is a plausible apex/plateau,
+    not just an arbitrary mid-trend point). Direction = sign(B3-B4).
+
+    CONFIRMED REVERSAL (forward): the delta spanning the 30-60s-after-t
+    range (X4-X3, the latest/trailing transition) must ALSO be the largest
+    in magnitude among the three consecutive forward deltas, AND must
+    point in the OPPOSITE direction from the established trend -- i.e.
+    the reversal is still BUILDING 30-60s out, not snapping back toward
+    the original trend (which would mean the apparent "reversal" was just
+    a continuation of sideways trading, not a genuine flip).
+
+    MAJORITY CHECK: at least 3 of the 4 forward bucket means (X1..X4) must
+    sit on the opposite side of the row's OWN current price (cb_price at
+    that exact row, not a bucket mean) from the established trend
+    direction.
+
+    A row gets label=1 only if ALL THREE conditions hold together.
+      1 = confirmed reversal by all three criteria
+      0 = a valid, well-shaped trend existed, but the reversal criteria
+          weren't all met (still trending, or shape/majority failed)
+      NaN = no valid established trend to begin with (backward shape or
+          $1 magnitude requirement not met), or insufficient tick data on
+          either side to compute all 8 buckets
+
+    No arbitrary percentage/log-return threshold anywhere -- purely
+    dollar-based ($1 minimum on the trend side), per explicit correction
+    that a flat percentage threshold was an ungrounded assumption."""
     n = len(grid_df)
-    if kalshi_price_df is None or "kalshi_momentum_15s" not in grid_df.columns:
+    if "cb_price" not in grid_df.columns:
         return pd.Series([np.nan] * n, index=grid_df.index)
 
-    baseline_df = pd.merge_asof(
-        grid_df[["timestamp"]], kalshi_price_df, on="timestamp", direction="backward",
-        tolerance=tolerance_seconds,
-    )
-    baseline_price = baseline_df["yes_mid_cents"].reset_index(drop=True)
+    dt_index = pd.to_datetime(grid_df["timestamp"], unit="s")
+    roll = grid_df.set_index(dt_index)["cb_price"].rolling(f"{int(bucket_seconds)}s").mean()
+    roll = roll.reset_index(drop=True)
+    roll.index = grid_df.index
 
-    target_lookup = grid_df[["timestamp"]].copy()
-    target_lookup["target_ts"] = target_lookup["timestamp"] + horizon_seconds
-    target_lookup = target_lookup.sort_values("target_ts")
-    target_df = pd.merge_asof(
-        target_lookup.rename(columns={"timestamp": "orig_ts", "target_ts": "timestamp"}),
-        kalshi_price_df, on="timestamp", direction="backward", tolerance=tolerance_seconds,
-    )
-    target_df = target_df.sort_values("orig_ts").reset_index(drop=True)
-    target_price = target_df["yes_mid_cents"]
+    B1 = roll  # (t-15, t] -- the row's own trailing 15s mean, no lookup needed
+    B2 = _rolling_mean_lookup(grid_df, roll, -bucket_seconds, tolerance_seconds)
+    B3 = _rolling_mean_lookup(grid_df, roll, -2 * bucket_seconds, tolerance_seconds)
+    B4 = _rolling_mean_lookup(grid_df, roll, -3 * bucket_seconds, tolerance_seconds)
 
-    forward_change = target_price - baseline_price
-    current_direction = np.sign(grid_df["kalshi_momentum_15s"].reset_index(drop=True))
+    X1 = _rolling_mean_lookup(grid_df, roll, bucket_seconds, tolerance_seconds)
+    X2 = _rolling_mean_lookup(grid_df, roll, 2 * bucket_seconds, tolerance_seconds)
+    X3 = _rolling_mean_lookup(grid_df, roll, 3 * bucket_seconds, tolerance_seconds)
+    X4 = _rolling_mean_lookup(grid_df, roll, 4 * bucket_seconds, tolerance_seconds)
+
+    price_at_t = grid_df["cb_price"].reset_index(drop=True)
+    B1, B2, B3, B4 = (s.reset_index(drop=True) for s in (B1, B2, B3, B4))
+    X1, X2, X3, X4 = (s.reset_index(drop=True) for s in (X1, X2, X3, X4))
+
+    # Backward: three consecutive chronological-forward deltas
+    d_late = B1 - B2    # 0-30s before t
+    d_mid = B2 - B3     # 15-45s before t
+    d_early = B3 - B4   # 30-60s before t -- must dominate
+
+    have_backward = B1.notna() & B2.notna() & B3.notna() & B4.notna()
+    trend_valid = (
+        have_backward
+        & (d_early.abs() >= d_late.abs())
+        & (d_early.abs() >= d_mid.abs())
+        & (d_early.abs() >= min_trend_dollars)
+    )
+    trend_direction = np.sign(d_early)
+
+    # Forward: three consecutive chronological-forward deltas
+    e_early = X2 - X1   # 0-30s after t
+    e_mid = X3 - X2      # 15-45s after t
+    e_late = X4 - X3     # 30-60s after t -- must dominate, opposite trend_direction
+
+    have_forward = X1.notna() & X2.notna() & X3.notna() & X4.notna()
+    reversal_shape = (
+        have_forward
+        & (e_late.abs() >= e_early.abs())
+        & (e_late.abs() >= e_mid.abs())
+        & (np.sign(e_late) == -trend_direction)
+        & (e_late != 0)
+    )
+
+    # Majority: >=3 of the 4 forward buckets on the opposite side of the
+    # row's own current price from the trend direction
+    up_trend = trend_direction > 0
+    down_trend = trend_direction < 0
+
+    majority_count = pd.Series(0, index=grid_df.index)
+    for X in (X1, X2, X3, X4):
+        X = pd.Series(X.to_numpy(), index=grid_df.index)
+        is_opposite = np.where(up_trend, X.to_numpy() < price_at_t.to_numpy(),
+                       np.where(down_trend, X.to_numpy() > price_at_t.to_numpy(), False))
+        majority_count = majority_count + is_opposite.astype(int)
+
+    majority_pass = majority_count >= 3
 
     label = pd.Series([np.nan] * n)
-    valid = forward_change.notna() & current_direction.notna() & (current_direction != 0)
-    reversed_mask = valid & (np.sign(forward_change) != current_direction) & (forward_change.abs() >= threshold_cents)
-    not_reversed_mask = valid & ~reversed_mask
+    valid_rows = trend_valid & have_forward
+    confirmed = valid_rows & reversal_shape & majority_pass
+    not_confirmed = valid_rows & ~(reversal_shape & majority_pass)
 
-    label[reversed_mask.to_numpy()] = 1
-    label[not_reversed_mask.to_numpy()] = 0
+    label[confirmed.to_numpy()] = 1
+    label[not_confirmed.to_numpy()] = 0
     label.index = grid_df.index
     return label
 
@@ -438,12 +516,13 @@ def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool,
     cb_seconds_remaining = {float(t["timestamp"]): float(t.get("feat_seconds_remaining", -1)) for t in cb_ticks}
     merged["seconds_remaining"] = merged["timestamp"].map(cb_seconds_remaining)
 
-    # General-purpose "is a reversal imminent right now" label -- usable at
-    # ANY point in the window, not just the settlement tail. This is what
-    # actually serves both entering on an expected trend AND exiting
-    # before an expected flip, since it's the same underlying question.
-    kalshi_price_df = _kalshi_ticks_to_price_df(kalshi_ticks)
-    merged["label_reversal"] = compute_reversal_labels(merged, kalshi_price_df)
+    # Continuous, real-price momentum/flip detector -- usable at ANY point,
+    # not tied to the window, strike, or settlement period at all. Answers
+    # "is the current real BTC price move about to reverse," independent
+    # of which Kalshi contract happens to be open -- an upswing that's
+    # ending as a new 15-min window opens is exactly the case this should
+    # catch, not something it resets or loses track of.
+    merged["label_reversal"] = compute_reversal_labels(merged)
 
     # "Does price actually cross the strike within the next horizon" --
     # the most directly trade-relevant of the three trained questions.
@@ -474,6 +553,14 @@ def build_window_dataframe(window_id: str, outcome_up: int, flip_occurred: bool,
     merged = merged[merged["timestamp"] >= ORDER_BOOK_FIX_CUTOFF_TS].reset_index(drop=True)
     if before_cutoff > len(merged):
         merged.attrs["rows_dropped_pre_cutoff"] = before_cutoff - len(merged)
+
+    # Stamped so the resume cache can detect STALE LOGIC, not just missing
+    # columns -- confirmed this failure mode has happened twice now:
+    # label_reversal's underlying computation changed (Kalshi-odds -> a
+    # window/strike-scoped version -> pure real-price momentum) without
+    # its COLUMN NAME ever changing, meaning a column-presence check alone
+    # would silently trust an old, wrongly-computed cached row forever.
+    merged.attrs["schema_version"] = FEATURE_SCHEMA_VERSION
 
     return merged
 
@@ -617,9 +704,10 @@ def load_dataset() -> pd.DataFrame:
                 cached_df = pd.read_pickle(out_path)
                 required_cols = {"label_reversal", "label_strike_cross"}
                 missing = required_cols - set(cached_df.columns)
-                if missing:
-                    log.warning(f"Cached file for {wid} predates current schema "
-                                 f"(missing {missing}) -- rebuilding it")
+                stale_version = cached_df.attrs.get("schema_version") != FEATURE_SCHEMA_VERSION
+                if missing or stale_version:
+                    reason = f"missing {missing}" if missing else f"schema_version mismatch (cached={cached_df.attrs.get('schema_version')}, current={FEATURE_SCHEMA_VERSION})"
+                    log.warning(f"Cached file for {wid} predates current schema ({reason}) -- rebuilding it")
                     del cached_df
                 else:
                     total_dropped_pre_cutoff += cached_df.attrs.get("rows_dropped_pre_cutoff", 0)
