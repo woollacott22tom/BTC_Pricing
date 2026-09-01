@@ -476,6 +476,7 @@ async def live():
         "features": feats,
         "flip": None,
         "strike_cross": None,
+        "kalshi_trend": None,
         "mean_surge": None,
         "kraken": None,
         "kalshi_strike": KALSHI_STATE["strike"],
@@ -554,6 +555,17 @@ async def live():
                 KALSHI_STATE["price_history"], now_ts,
             )
             row_dict.update(kalshi_momentum_row)
+
+            # Surface the current trend direction the reversal model is
+            # actually using -- reversal probability is symmetric by
+            # design (it's P(reverses against WHATEVER the current
+            # direction is)), so the raw number alone can't tell you
+            # which direction "current" means. Same feature the model
+            # itself trained the reversal label against, not a separate
+            # recomputation.
+            m15 = kalshi_momentum_row.get("kalshi_momentum_15s")
+            if m15 is not None:
+                result["kalshi_trend"] = "up" if m15 > 0 else ("down" if m15 < 0 else "flat")
 
             row = [[row_dict.get(c, np.nan) for c in cols]]
             X = np.array(row, dtype=float)
