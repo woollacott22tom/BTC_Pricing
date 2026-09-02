@@ -10,6 +10,10 @@ and "book" channels (Kraken's level3/order-level channel needs a token;
 the aggregated level2 "book" channel used here does not, confirmed from
 Kraken's own docs).
 
+Buy/sell volume: Kraken's trade "side" field is the TAKER's side directly
+(confirmed against Kraken's own v2 API docs: "buy" = taker bought, "sell"
+= taker sold) -- unlike Coinbase, no inversion needed here.
+
 Every ~1 second it:
   1. Computes a feature snapshot from the rolling buffer + live order book
   2. Writes a tick row to kraken_ticks
@@ -69,6 +73,8 @@ async def run():
     last_logged = 0.0
     last_trade_price: float | None = None
     pending_volume = 0.0
+    pending_buy_volume = 0.0
+    pending_sell_volume = 0.0
 
     # Same trade-flow diagnostic added to crypto_ingestion.py, for a fair
     # apples-to-apples comparison of actual trade frequency between feeds.
@@ -120,6 +126,15 @@ async def run():
                             last_trade_price = price
                             pending_volume += volume
 
+                            side = entry.get("side")
+                            if isinstance(side, str) and side.lower() == "buy":
+                                pending_buy_volume += volume
+                            elif isinstance(side, str) and side.lower() == "sell":
+                                pending_sell_volume += volume
+                            # else: side missing/unrecognized -- volume still
+                            # counted in pending_volume above, just not
+                            # attributed to either buy or sell side
+
                     elif msg.get("method") == "subscribe" and not msg.get("success", True):
                         log.error(f"Kraken subscribe error: {msg}")
 
@@ -153,6 +168,7 @@ async def run():
                             timestamp=now_ts,
                             tick_fields={
                                 "price": last_trade_price, "volume": pending_volume,
+                                "buy_volume": pending_buy_volume, "sell_volume": pending_sell_volume,
                                 "best_bid": tick.best_bid, "best_ask": tick.best_ask,
                                 "bid_depth_top10": tick.bid_depth_top10,
                                 "ask_depth_top10": tick.ask_depth_top10,
@@ -165,6 +181,8 @@ async def run():
                         )
                         last_logged = now_ts
                         pending_volume = 0.0
+                        pending_buy_volume = 0.0
+                        pending_sell_volume = 0.0
 
         except websockets.ConnectionClosed as e:
             log.warning(f"WebSocket closed, reconnecting... code={e.code} reason={e.reason!r}")

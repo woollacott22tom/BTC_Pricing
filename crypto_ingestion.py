@@ -19,6 +19,14 @@ Crypto.com's API is known to require responding to server-sent heartbeat
 pings (method: "public/heartbeat") with a matching respond-heartbeat
 message, or the connection gets dropped -- handled below.
 
+Buy/sell volume: Crypto.com's own public changelog explicitly clarifies
+"Side is the side of the taker order" for the trade channel -- confirmed
+directly, no inversion needed (unlike Coinbase). Given the same shape
+uncertainty flagged above, side parsing is defensive here too, trying
+both the casing seen in Crypto.com's older docs (BUY/SELL) and the
+lowercase convention used elsewhere (buy/sell) -- an unrecognized value
+is left unattributed rather than guessed at.
+
 The raw-message debug logging (first 10 messages) is deliberately more
 generous here than Kraken's was, since we genuinely don't know the shape
 yet -- use these logs to correct crypto_order_book.py's parsing if needed.
@@ -65,15 +73,28 @@ def _subscribe_msg() -> dict:
     }
 
 
-def _try_parse_trade(entry: dict) -> tuple[float, float] | None:
+def _try_parse_trade(entry: dict) -> tuple[float, float, str | None] | None:
     """Defensive parsing -- Crypto.com's docs have shown both short (p/q)
-    and long (price/quantity) field name conventions across versions."""
+    and long (price/quantity) field name conventions across versions.
+    Now also extracts taker side (confirmed via Crypto.com's own changelog:
+    "Side is the side of the taker order", no inversion needed) -- tried
+    against both the uppercase (BUY/SELL) casing seen in their older docs
+    and lowercase, since the live shape hasn't been independently verified
+    the way Kraken's was. An unrecognized/missing side returns None for
+    that element rather than guessing."""
     try:
         price = entry.get("p", entry.get("price"))
         qty = entry.get("q", entry.get("quantity", entry.get("qty")))
         if price is None or qty is None:
             return None
-        return float(price), float(qty)
+        side_raw = entry.get("s", entry.get("side"))
+        side = None
+        if isinstance(side_raw, str):
+            if side_raw.upper() == "BUY":
+                side = "BUY"
+            elif side_raw.upper() == "SELL":
+                side = "SELL"
+        return float(price), float(qty), side
     except (TypeError, ValueError):
         return None
 
@@ -140,7 +161,17 @@ async def run():
                             if parsed is None:
                                 log.warning(f"Trade entry failed to parse -- unrecognized shape: {entry}")
                                 continue
-                            price, volume = parsed
+                            price, volume, side = parsed
+
+                            # No cross-trade volume accumulator in this
+                            # file (unlike Kraken/Coinbase) -- each trade
+                            # writes its own tick immediately (rate-limited
+                            # below), so buy/sell volume here is just this
+                            # SINGLE trade's own volume attributed to
+                            # whichever side it was, consistent with how
+                            # "volume" itself already works in this file.
+                            buy_volume = volume if side == "BUY" else 0.0
+                            sell_volume = volume if side == "SELL" else 0.0
 
                             tick = Tick(
                                 ts=now_ts, price=price, volume=volume,
@@ -166,6 +197,7 @@ async def run():
                                     timestamp=now_ts,
                                     tick_fields={
                                         "price": price, "volume": volume,
+                                        "buy_volume": buy_volume, "sell_volume": sell_volume,
                                         "best_bid": tick.best_bid, "best_ask": tick.best_ask,
                                         "bid_depth_top10": tick.bid_depth_top10,
                                         "ask_depth_top10": tick.ask_depth_top10,
