@@ -11,9 +11,17 @@ BTC-USD.
   Authenticating with a CDP API key (JWT, Ed25519) is also required for
   reliable level2 delivery, per Coinbase's own guidance.
 
-  - "market_trades" channel: trade prints (price/size)
+  - "market_trades" channel: trade prints (price/size/side)
   - "level2" channel: full order book, snapshot then incremental updates
     (tracked locally via order_book.OrderBook)
+
+  Buy/sell volume: Coinbase's "side" field on each trade is the MAKER's
+  side, not the taker's -- confirmed directly against Coinbase's own docs.
+  A maker SELL means the taker crossed the spread to BUY (an up-tick); a
+  maker BUY means the taker SOLD (a down-tick). We invert it here so
+  buy_volume/sell_volume represent the AGGRESSOR (taker) side, which is
+  what "buying pressure" actually means -- storing the raw maker-side
+  value as-is would silently have this backwards.
 
 Requires environment variables:
   COINBASE_SECRET_NAME   e.g. "btc-kalshi/coinbase-api-key"
@@ -111,12 +119,29 @@ class WindowState:
         }
 
 
+def _taker_side_from_coinbase_maker_side(maker_side: str | None) -> str | None:
+    """Coinbase's trade 'side' field is the MAKER's side -- confirmed
+    against Coinbase's own docs ('a buy side match is a down-tick', i.e. a
+    maker BUY means the taker SOLD). Inverted here so the result represents
+    the AGGRESSOR (taker), which is what buy/sell volume is actually meant
+    to capture. Returns None for anything unrecognized rather than
+    guessing, so a malformed/unexpected value shows up as missing data,
+    not silently-wrong data."""
+    if maker_side == "SELL":
+        return "BUY"
+    if maker_side == "BUY":
+        return "SELL"
+    return None
+
+
 async def run():
     buf = RollingBuffer(max_seconds=900)
     state = WindowState()
     last_logged = 0.0
     last_trade_price: float | None = None
     pending_volume = 0.0
+    pending_buy_volume = 0.0
+    pending_sell_volume = 0.0
 
     async for ws in _reconnecting_ws(ADVANCED_TRADE_WS):
         try:
@@ -146,6 +171,15 @@ async def run():
                                 continue
                             last_trade_price = price
                             pending_volume += volume
+
+                            taker_side = _taker_side_from_coinbase_maker_side(trade.get("side"))
+                            if taker_side == "BUY":
+                                pending_buy_volume += volume
+                            elif taker_side == "SELL":
+                                pending_sell_volume += volume
+                            # else: side missing/unrecognized -- volume still
+                            # counted in pending_volume above, just not
+                            # attributed to either buy or sell side
 
                 elif msg.get("type") == "error":
                     log.error(f"Coinbase feed error: {msg}")
@@ -190,6 +224,7 @@ async def run():
                         timestamp=now_ts,
                         tick_fields={
                             "price": last_trade_price, "volume": pending_volume,
+                            "buy_volume": pending_buy_volume, "sell_volume": pending_sell_volume,
                             "best_bid": tick.best_bid, "best_ask": tick.best_ask,
                             "bid_depth_top10": tick.bid_depth_top10,
                             "ask_depth_top10": tick.ask_depth_top10,
@@ -202,6 +237,8 @@ async def run():
                     )
                     last_logged = now_ts
                     pending_volume = 0.0
+                    pending_buy_volume = 0.0
+                    pending_sell_volume = 0.0
 
         except websockets.ConnectionClosed as e:
             log.warning(f"WebSocket closed, reconnecting... code={e.code} reason={e.reason!r}")
