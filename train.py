@@ -750,7 +750,53 @@ def load_dataset() -> pd.DataFrame:
     log.info(f"{windows_resumed_from_cache} windows resumed from a prior run's cache, "
              f"{windows_processed_this_run} newly processed this run")
 
-    cached_files = [os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".pkl")]
+    # CRITICAL: only read back files corresponding to a window_id in the
+    # CURRENT windows list, filtered by the CURRENT schema version -- a
+    # bare os.listdir() glob (the previous version of this code) blindly
+    # includes ANY .pkl file sitting in cache_dir, including orphaned
+    # files left over from an earlier attempt using an older, incompatible
+    # label/feature schema. Those files' window_ids may never have been
+    # visited by this run's per-window loop above at all (e.g. if an
+    # earlier partial run processed a different or overlapping window
+    # list), meaning they were NEVER schema-validated -- silently
+    # corrupting the final concatenated dataset with stale-logic rows
+    # while every individual per-window check looked completely correct.
+    # Confirmed as the real cause of a near-total label collapse (0 and
+    # 19 usable rows out of 1.15M) despite every smaller, direct test
+    # showing healthy ~30%/~99% label validity -- the one thing every
+    # healthy test had in common was bypassing this exact line.
+    expected_filenames = {_safe_cache_filename(w["window_id"]) for w in windows}
+    cached_files = []
+    skipped_orphaned = 0
+    skipped_stale_at_readback = 0
+    for fname in os.listdir(cache_dir):
+        if not fname.endswith(".pkl"):
+            continue
+        if fname not in expected_filenames:
+            skipped_orphaned += 1
+            continue
+        path = os.path.join(cache_dir, fname)
+        try:
+            check_df = pd.read_pickle(path)
+            required_cols = {"label_reversal", "label_strike_cross"}
+            missing = required_cols - set(check_df.columns)
+            stale_version = check_df.attrs.get("schema_version") != FEATURE_SCHEMA_VERSION
+            del check_df
+            if missing or stale_version:
+                skipped_stale_at_readback += 1
+                continue
+        except Exception:
+            skipped_stale_at_readback += 1
+            continue
+        cached_files.append(path)
+
+    if skipped_orphaned > 0:
+        log.warning(f"Excluded {skipped_orphaned} orphaned cache file(s) not corresponding to "
+                     f"any window in this run -- likely leftover from an earlier attempt")
+    if skipped_stale_at_readback > 0:
+        log.warning(f"Excluded {skipped_stale_at_readback} cache file(s) that failed schema "
+                     f"validation at final read-back (missing columns or stale schema_version)")
+
     if not cached_files:
         log.warning("No usable windows with tick data found. Exiting.")
         sys.exit(0)
@@ -951,7 +997,7 @@ def compute_block_summary(window_id: str, ticks: list[dict], strike_price: float
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     window_start_ts = df["timestamp"].iloc[0]
-    volumes = df["volume"].fillna(0.0) if "volume" in df.columns else pd.Series([0.0] * len(df))
+    volumes = df["volume"].astype(float).fillna(0.0) if "volume" in df.columns else pd.Series([0.0] * len(df))
     prices = df["price"].astype(float)
 
     total_volume = float(volumes.sum())
@@ -963,7 +1009,7 @@ def compute_block_summary(window_id: str, ticks: list[dict], strike_price: float
     valid_bucket_count = 0
     if "book_imbalance" in df.columns:
         df["_sub_bucket"] = ((df["timestamp"] - window_start_ts) // sub_bucket_seconds).astype(int)
-        bucket_means = df.groupby("_sub_bucket")["book_imbalance"].mean()
+        bucket_means = df.groupby("_sub_bucket")["book_imbalance"].apply(lambda s: s.astype(float).mean())
         for val in bucket_means:
             tier = _imbalance_tier(val)
             if tier is not None:
