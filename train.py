@@ -896,30 +896,400 @@ def train_strike_cross_model(df: pd.DataFrame):
     }
 
 
-def save_artifacts(reversal_model, strike_cross_model, metrics: dict, feature_cols: list[str]):
+IMBALANCE_TIER_CUTOFFS = (0.6, 0.2)  # heavy at +-0.6, medium at +-0.2, per explicit confirmation
+
+
+def _imbalance_tier(value: float) -> str | None:
+    """Classifies a single book_imbalance reading into one of six tiers.
+    Returns None for NaN rather than guessing a tier."""
+    if pd.isna(value):
+        return None
+    heavy, medium = IMBALANCE_TIER_CUTOFFS
+    if value >= heavy:
+        return "heavy_pos"
+    elif value >= medium:
+        return "medium_pos"
+    elif value >= 0.0:
+        return "light_pos"
+    elif value >= -medium:
+        return "light_neg"
+    elif value >= -heavy:
+        return "medium_neg"
+    else:
+        return "heavy_neg"
+
+
+TIER_NAMES = ["heavy_pos", "medium_pos", "light_pos", "light_neg", "medium_neg", "heavy_neg"]
+
+
+def compute_block_summary(window_id: str, ticks: list[dict], strike_price: float,
+                           sub_bucket_seconds: float = 15.0) -> dict | None:
+    """Summarizes ONE 15-minute block (window) into a fixed-width feature
+    row: VWAP-style price, volume, a book-imbalance TIER PROFILE (% of 15s
+    sub-buckets in each of six tiers, chosen over a plain average since
+    book imbalance oscillates fast and symmetrically -- a raw mean would
+    wash toward zero and hide persistent one-sided pressure), and
+    strike-relative metrics (time/mean price above vs below, cross-count
+    split front/back half, max distance either direction).
+
+    Buy/sell volume is intentionally NOT included yet -- it's only been
+    captured going forward from tonight, so it would be entirely missing
+    for all historical training data. Left out here rather than included
+    as an always-NaN column, to keep this function's real, current
+    behavior honest about what it actually computes today.
+
+    Returns None if there's not enough tick data to summarize meaningfully
+    (fewer than 10 ticks) -- consistent with other functions in this file
+    treating "not enough data" as a real, explicit case, not a silent
+    zero-filled row."""
+    if len(ticks) < 10:
+        return None
+
+    df = pd.DataFrame(ticks)
+    if "timestamp" not in df.columns or "price" not in df.columns:
+        return None
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    window_start_ts = df["timestamp"].iloc[0]
+    volumes = df["volume"].fillna(0.0) if "volume" in df.columns else pd.Series([0.0] * len(df))
+    prices = df["price"].astype(float)
+
+    total_volume = float(volumes.sum())
+    vwap = float((prices * volumes).sum() / total_volume) if total_volume > 0 else float(prices.mean())
+
+    # Book-imbalance tier profile: bucket into 15s sub-buckets, classify
+    # each sub-bucket's MEAN imbalance, report % of sub-buckets per tier
+    tier_counts = {t: 0 for t in TIER_NAMES}
+    valid_bucket_count = 0
+    if "book_imbalance" in df.columns:
+        df["_sub_bucket"] = ((df["timestamp"] - window_start_ts) // sub_bucket_seconds).astype(int)
+        bucket_means = df.groupby("_sub_bucket")["book_imbalance"].mean()
+        for val in bucket_means:
+            tier = _imbalance_tier(val)
+            if tier is not None:
+                tier_counts[tier] += 1
+                valid_bucket_count += 1
+
+    tier_pct = {
+        f"imbalance_pct_{t}": (tier_counts[t] / valid_bucket_count if valid_bucket_count > 0 else np.nan)
+        for t in TIER_NAMES
+    }
+
+    # Strike-relative metrics
+    rel = prices - strike_price
+    above_mask = rel > 0
+    below_mask = rel < 0
+
+    ts_deltas = df["timestamp"].diff().fillna(0.0)
+    time_above = float(ts_deltas[above_mask].sum())
+    time_below = float(ts_deltas[below_mask].sum())
+    mean_price_above = float(prices[above_mask].mean()) if above_mask.any() else np.nan
+    mean_price_below = float(prices[below_mask].mean()) if below_mask.any() else np.nan
+    max_dist_above = float(rel[above_mask].max()) if above_mask.any() else 0.0
+    max_dist_below = float((-rel[below_mask]).max()) if below_mask.any() else 0.0
+
+    sign = np.sign(rel).replace(0, np.nan).ffill().fillna(0)
+    crosses = (sign.diff().abs() > 0).fillna(False)
+    window_duration = df["timestamp"].iloc[-1] - window_start_ts
+    front_half_mask = (df["timestamp"] - window_start_ts) < (window_duration / 2.0)
+    cross_count_front = int(crosses[front_half_mask].sum())
+    cross_count_back = int(crosses[~front_half_mask].sum())
+
+    row = {
+        "window_id": window_id,
+        "vwap": vwap,
+        "total_volume": total_volume,
+        "time_above_strike": time_above,
+        "time_below_strike": time_below,
+        "mean_price_above_strike": mean_price_above,
+        "mean_price_below_strike": mean_price_below,
+        "max_dist_above_strike": max_dist_above,
+        "max_dist_below_strike": max_dist_below,
+        "cross_count_front_half": cross_count_front,
+        "cross_count_back_half": cross_count_back,
+    }
+    row.update(tier_pct)
+    return row
+MIN_CONFIRMED_STREAK_LENGTH = 3  # per explicit confirmation
+
+
+def segment_chunks(directions: list[int], min_streak: int = MIN_CONFIRMED_STREAK_LENGTH) -> list[int | None]:
+    """Given block directions (+1/-1) in chronological order, assigns each
+    block a chunk_id. A chunk spans from the start of one CONFIRMED (3+)
+    same-direction streak up to -- but not including -- the block where
+    the NEXT confirmed streak begins. Blocks before the very first
+    confirmed streak get chunk_id=None (not enough history yet to belong
+    to any chunk) -- explicit, not silently zero-filled.
+
+    Verified against a hand-traced 12-block sequence with three confirmed
+    streaks and two intervening single-block breaks before shipping."""
+    n = len(directions)
+    streaks = []  # (start_idx, length)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and directions[j + 1] == directions[i]:
+            j += 1
+        streaks.append((i, j - i + 1))
+        i = j + 1
+
+    confirmed_starts = [s[0] for s in streaks if s[1] >= min_streak]
+
+    chunk_id: list[int | None] = [None] * n
+    for k, start in enumerate(confirmed_starts):
+        end = confirmed_starts[k + 1] if k + 1 < len(confirmed_starts) else n
+        for idx in range(start, end):
+            chunk_id[idx] = k
+    return chunk_id
+AGG_FIELDS = [
+    "total_volume", "time_above_strike", "time_below_strike",
+    "max_dist_above_strike", "max_dist_below_strike",
+    "cross_count_front_half", "cross_count_back_half",
+] + [f"imbalance_pct_{t}" for t in TIER_NAMES]
+
+
+def build_lookback_features(block_rows: list[dict], directions: list[int],
+                             chunk_ids: list[int | None]) -> list[dict]:
+    """For each block, computes a FIXED-WIDTH feature row combining:
+      own_*        -- the block's own summary (from compute_block_summary)
+      chunk_*       -- aggregates over the CURRENT chunk so far (from the
+                       chunk's start through and including this block)
+      prev_chunk_*  -- aggregates over the ENTIRE previous chunk (a fixed,
+                       already-complete set of stats, since that chunk has
+                       already ended)
+
+    prev_chunk_* fields are NaN for any block in the first chunk of the
+    whole sequence (no previous chunk exists yet) -- explicit, not
+    silently zero-filled. Blocks with chunk_id=None (not enough history
+    for even a first confirmed streak) are skipped entirely -- there's no
+    meaningful chunk context to build for them yet.
+
+    Verified against a hand-traced sequence with a clear volume/direction
+    contrast between two chunks before shipping."""
+    n = len(block_rows)
+    output = []
+
+    for i in range(n):
+        cid = chunk_ids[i]
+        if cid is None:
+            continue
+
+        row = {"window_id": block_rows[i]["window_id"], "direction": directions[i], "chunk_id": cid}
+        for k, v in block_rows[i].items():
+            if k not in ("window_id",):
+                row[f"own_{k}"] = v
+
+        # Current chunk so far: from this chunk's start through index i inclusive
+        chunk_indices_so_far = [j for j in range(n) if chunk_ids[j] == cid and j <= i]
+        row["chunk_length_so_far"] = len(chunk_indices_so_far)
+        row["chunk_direction"] = directions[chunk_indices_so_far[0]]
+        for field in AGG_FIELDS:
+            vals = [block_rows[j][field] for j in chunk_indices_so_far if field in block_rows[j]]
+            row[f"chunk_avg_{field}"] = float(np.nanmean(vals)) if vals else np.nan
+        vwaps_so_far = [block_rows[j]["vwap"] for j in chunk_indices_so_far]
+        row["chunk_net_price_move"] = vwaps_so_far[-1] - vwaps_so_far[0] if len(vwaps_so_far) > 1 else 0.0
+
+        # Previous chunk: the ENTIRE previous chunk, a fixed/complete set of blocks
+        if cid > 0:
+            prev_indices = [j for j in range(n) if chunk_ids[j] == cid - 1]
+        else:
+            prev_indices = []
+
+        if prev_indices:
+            row["prev_chunk_length"] = len(prev_indices)
+            row["prev_chunk_direction"] = directions[prev_indices[0]]
+            for field in AGG_FIELDS:
+                vals = [block_rows[j][field] for j in prev_indices if field in block_rows[j]]
+                row[f"prev_chunk_avg_{field}"] = float(np.nanmean(vals)) if vals else np.nan
+            prev_vwaps = [block_rows[j]["vwap"] for j in prev_indices]
+            row["prev_chunk_net_price_move"] = prev_vwaps[-1] - prev_vwaps[0] if len(prev_vwaps) > 1 else 0.0
+        else:
+            row["prev_chunk_length"] = np.nan
+            row["prev_chunk_direction"] = np.nan
+            for field in AGG_FIELDS:
+                row[f"prev_chunk_avg_{field}"] = np.nan
+            row["prev_chunk_net_price_move"] = np.nan
+
+        output.append(row)
+
+    return output
+def build_block_dataset() -> pd.DataFrame:
+    """Assembles the block-level (one row per 15-minute window) training
+    dataset for the continuation/reversal model. Fundamentally different
+    granularity from load_dataset() (one row per TICK) -- this fetches
+    each window's own raw ticks just to SUMMARIZE them into one row, not
+    to keep every tick.
+
+    Pipeline: fetch windows in order (same pre-cutoff exclusion as
+    load_dataset) -> summarize each block's own ticks -> segment into
+    chunks (confirmed 3+ streaks) -> build lookback features (current
+    chunk so far + entire previous chunk) -> compute continuation labels.
+    """
+    windows = list_closed_windows(region_name=REGION)
+    windows = [w for w in windows if w.get("source") != "backfill"]
+    windows = [
+        w for w in windows
+        if datetime.fromisoformat(w["window_id"]).timestamp() + 900.0 > ORDER_BOOK_FIX_CUTOFF_TS
+    ]
+    windows = sorted(windows, key=lambda w: w["window_id"])
+    log.info(f"[Continuation] {len(windows)} usable (post-cutoff) windows to summarize")
+
+    block_rows = []
+    directions = []
+    for i, w in enumerate(windows):
+        ticks = get_generic_window_ticks("btc_ticks", w["window_id"], region=REGION)
+        if not ticks:
+            continue
+        ticks_sorted = sorted(ticks, key=lambda t: float(t["timestamp"]))
+        strike_price = float(ticks_sorted[0]["price"])
+        summary = compute_block_summary(w["window_id"], ticks_sorted, strike_price)
+        if summary is None:
+            continue
+        block_rows.append(summary)
+        directions.append(1 if w["outcome"] == "up" else -1)
+        if i % 100 == 0:
+            log.info(f"[Continuation]   summarized {i}/{len(windows)} windows")
+
+    log.info(f"[Continuation] {len(block_rows)} windows successfully summarized "
+              f"(out of {len(windows)} attempted)")
+
+    chunk_ids = segment_chunks(directions)
+    feature_rows = build_lookback_features(block_rows, directions, chunk_ids)
+    log.info(f"[Continuation] {len(feature_rows)} blocks fall within a confirmed chunk "
+              f"(out of {len(block_rows)} summarized) -- blocks before the first confirmed "
+              f"3+ streak are excluded, not enough history yet")
+
+    # Labels computed against the ORIGINAL full direction sequence (by
+    # position), then attached to feature_rows by matching window_id --
+    # keeps label computation correct regardless of which blocks got
+    # dropped for lacking chunk context.
+    continuation_labels = compute_continuation_labels(directions)
+    label_by_window = {block_rows[i]["window_id"]: continuation_labels[i] for i in range(len(block_rows))}
+
+    df = pd.DataFrame(feature_rows)
+    df["label_continuation"] = df["window_id"].map(label_by_window)
+    return df
+
+
+def compute_continuation_labels(directions: list) -> list:
+    """label[i] = 1 if directions[i+1] == directions[i] (continuation), 0
+    if it flips (reversal), evaluated at EVERY consecutive transition
+    regardless of streak length. NaN for the last block (no next block to
+    compare against). Verified against two hand-worked example sequences
+    before shipping."""
+    n = len(directions)
+    labels = []
+    for i in range(n):
+        if i == n - 1:
+            labels.append(np.nan)
+        else:
+            labels.append(1.0 if directions[i + 1] == directions[i] else 0.0)
+    return labels
+
+
+CONTINUATION_FEATURE_COLS = None  # populated dynamically from build_block_dataset()'s
+                                    # actual output columns in train_continuation_model(),
+                                    # since this feature set's shape (own_*/chunk_*/
+                                    # prev_chunk_* fields) is naturally derived rather
+                                    # than a fixed list like FEATURE_COLS
+
+
+def train_continuation_model(df: pd.DataFrame):
+    """Block-level (one row per 15-min window) continuation/reversal
+    model -- 'given the established trend so far, does the NEXT block
+    continue it or flip.' Deliberately NOT restricted to only rows in an
+    established trend already: every block-to-block transition is a
+    labeled row, so 'it won't reverse' rows carry equal weight to 'it
+    will' rows, per explicit correction that focusing only on reversals
+    would discount half the real signal."""
+    exclude_cols = {"window_id", "direction", "chunk_id", "label_continuation"}
+    X_cols = [c for c in df.columns if c not in exclude_cols]
+    df = df.dropna(subset=["label_continuation"])
+    log.info(f"[Continuation] {len(df)} rows have a usable label "
+              f"(excludes only the final block of the sequence, which has no next block)")
+
+    if len(df) < MIN_WINDOWS_REQUIRED:
+        log.warning(f"Only {len(df)} labeled blocks available (< {MIN_WINDOWS_REQUIRED} minimum). "
+                     "Keep collecting data before training this model. Skipping.")
+        return None, {}
+
+    pos_rate = df["label_continuation"].mean()
+    log.info(f"[Continuation] label balance: {pos_rate*100:.2f}% continuation "
+              f"(n={len(df)})")
+
+    aucs, briers = [], []
+    for train_df, test_df in walk_forward_splits(df, n_splits=3):
+        if train_df.empty or test_df.empty:
+            continue
+        model = xgb.XGBClassifier(
+            n_estimators=150, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
+        )
+        model.fit(train_df[X_cols], train_df["label_continuation"])
+        preds = model.predict_proba(test_df[X_cols])[:, 1]
+        if test_df["label_continuation"].nunique() > 1:
+            aucs.append(roc_auc_score(test_df["label_continuation"], preds))
+        briers.append(brier_score_loss(test_df["label_continuation"], preds))
+
+    log.info(f"[Continuation] walk-forward AUC: {np.mean(aucs) if aucs else float('nan'):.4f} | "
+              f"Brier: {np.mean(briers):.4f}")
+
+    final_model = xgb.XGBClassifier(
+        n_estimators=150, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
+    )
+    final_model.fit(df[X_cols], df["label_continuation"])
+
+    importances = dict(zip(X_cols, final_model.feature_importances_.tolist()))
+    sorted_importances = dict(sorted(importances.items(), key=lambda x: -x[1])[:15])
+    log.info("[Continuation] Top 15 feature importances:")
+    for k, v in sorted_importances.items():
+        log.info(f"  {k}: {v:.4f}")
+
+    return final_model, {
+        "auc": float(np.mean(aucs)) if aucs else None,
+        "brier": float(np.mean(briers)),
+        "pos_rate": float(pos_rate),
+        "feature_cols": X_cols,
+        "top_feature_importances": sorted_importances,
+    }
+
+
+def save_artifacts(reversal_model, strike_cross_model, continuation_model, metrics: dict,
+                    feature_cols: list[str], continuation_feature_cols: list[str] | None):
     """NOTE: directional/settlement model intentionally no longer trained
-    or saved -- scrapped in favor of focusing on reversal and (now)
-    strike-crossing, both of which ask more directly trade-relevant
-    questions than "where will price settle"."""
+    or saved -- scrapped in favor of reversal, strike-crossing, and (now)
+    block-level continuation, all of which ask more directly trade-
+    relevant questions than "where will price settle". continuation_model
+    uses its OWN dynamically-derived feature set (own_*/chunk_*/
+    prev_chunk_* columns), saved separately from feature_cols since it is
+    structurally different from the tick-level FEATURE_COLS the other two
+    models share."""
     os.makedirs(ARTIFACT_DIR, exist_ok=True)
     if reversal_model is not None:
         reversal_model.save_model(os.path.join(ARTIFACT_DIR, "flip_model.json"))
     if strike_cross_model is not None:
         strike_cross_model.save_model(os.path.join(ARTIFACT_DIR, "strike_cross_model.json"))
+    if continuation_model is not None:
+        continuation_model.save_model(os.path.join(ARTIFACT_DIR, "continuation_model.json"))
     with open(os.path.join(ARTIFACT_DIR, "metadata.json"), "w") as f:
         json.dump({
             "trained_at": datetime.utcnow().isoformat(),
             "feature_cols": feature_cols,
+            "continuation_feature_cols": continuation_feature_cols,
             "metrics": metrics,
             "note": "flip_model.json holds the general-purpose reversal model (usable at "
                     "any point in the window). strike_cross_model.json predicts whether "
-                    "price actually crosses the strike within the next horizon -- the "
-                    "settlement/directional model was scrapped entirely.",
+                    "price actually crosses the strike within the next horizon. "
+                    "continuation_model.json is block-level (one prediction per 15-min "
+                    "window, not continuous) -- predicts whether the NEXT block continues "
+                    "or reverses the current established trend, using chunk-level lookback "
+                    "features. The settlement/directional model was scrapped entirely.",
         }, f, indent=2)
 
     try:
         s3 = boto3.client("s3", region_name=REGION)
-        for fname in ["flip_model.json", "strike_cross_model.json", "metadata.json"]:
+        for fname in ["flip_model.json", "strike_cross_model.json", "continuation_model.json", "metadata.json"]:
             local_path = os.path.join(ARTIFACT_DIR, fname)
             if os.path.exists(local_path):
                 s3.upload_file(local_path, S3_BUCKET, f"models/{fname}")
@@ -932,9 +1302,18 @@ def main():
     df = load_dataset()
     reversal_model, reversal_metrics = train_reversal_model(df)
     strike_cross_model, strike_cross_metrics = train_strike_cross_model(df)
-    save_artifacts(reversal_model, strike_cross_model,
-                    {"reversal": reversal_metrics, "strike_cross": strike_cross_metrics},
-                    [c for c in FEATURE_COLS if c in df.columns])
+
+    log.info("=" * 60)
+    log.info("Building block-level continuation dataset (separate pipeline, "
+              "one row per 15-min window rather than per tick)...")
+    block_df = build_block_dataset()
+    continuation_model, continuation_metrics = train_continuation_model(block_df)
+
+    save_artifacts(reversal_model, strike_cross_model, continuation_model,
+                    {"reversal": reversal_metrics, "strike_cross": strike_cross_metrics,
+                     "continuation": continuation_metrics},
+                    [c for c in FEATURE_COLS if c in df.columns],
+                    continuation_metrics.get("feature_cols"))
     log.info("Training complete.")
 
 
