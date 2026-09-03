@@ -53,6 +53,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from decimal import Decimal
 from sklearn.metrics import brier_score_loss, roc_auc_score
 import xgboost as xgb
 import boto3
@@ -239,6 +240,30 @@ def get_generic_window_ticks(table_name: str, window_id: str, region: str = REGI
         )
         items.extend(resp["Items"])
     return sorted(items, key=lambda x: float(x["timestamp"]))
+
+
+def update_window_streak_length(window_id: str, streak_length: int, region: str = REGION) -> None:
+    """Persists the computed streak_length as an attribute on the
+    window's own btc_windows record -- once written, ANY future consumer
+    (a later training run, a live service restart) can derive the NEXT
+    window's streak_length via a single lookup of THIS value via
+    compute_next_streak_length, rather than needing to re-derive it from
+    whatever's visible in a limited buffer and risk understating a real
+    streak that started earlier than that buffer's visibility. Failures
+    are logged, not raised -- a missed write here shouldn't crash a
+    training run; the next window processed will just fall back to
+    treating itself as a fresh start, a harmless, self-correcting
+    one-time approximation, not a hard failure."""
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=region)
+        table = dynamodb.Table("btc_windows")
+        table.update_item(
+            Key={"window_id": window_id},
+            UpdateExpression="SET streak_length = :sl",
+            ExpressionAttributeValues={":sl": Decimal(str(streak_length))},
+        )
+    except Exception as e:
+        log.warning(f"Failed to persist streak_length for {window_id}: {e}")
 
 
 def _ticks_to_feature_df(ticks: list[dict], prefix: str) -> pd.DataFrame | None:
@@ -996,6 +1021,18 @@ def build_block_dataset() -> pd.DataFrame:
     feature_rows = build_lookback_features(block_rows, directions)
     log.info(f"[Continuation] {len(feature_rows)} feature rows built from "
               f"{len(block_rows)} summarized windows (every block included)")
+
+    # Persist each window's streak_length back to its own btc_windows
+    # record -- this is what lets live serving derive the NEXT window's
+    # streak_length via a single lookup of the true prior value, rather
+    # than re-deriving it from a bounded live buffer (which can
+    # understate a real streak that started earlier than that buffer's
+    # visibility, especially right after a service restart). Written for
+    # every window here, not just the newest ones, so this backfills the
+    # entire historical dataset on the run this ships in.
+    for row in feature_rows:
+        update_window_streak_length(row["window_id"], int(row["streak_length"]), region=REGION)
+    log.info(f"[Continuation] persisted streak_length for {len(feature_rows)} windows to btc_windows")
 
     # Labels computed against the ORIGINAL full direction sequence (by
     # position), then attached to feature_rows by matching window_id.
