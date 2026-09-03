@@ -245,12 +245,16 @@ def compute_live_block_summary(buf, window_id: str, window_start_ts: float, stri
 
 
 def score_continuation_live():
-    """Returns (p_live, p_future).
+    """Returns (p_live, p_future, live_trend_direction).
 
     Live: does the CURRENTLY OPEN window continue the trend established
     by the last CLOSED window -- built entirely from settled, ground-
     truth history. Stable; only changes once every 15 minutes, right
-    when a window closes.
+    when a window closes. live_trend_direction is that established
+    trend's OWN direction (chunk_direction of the last closed window) --
+    exposed so the dashboard can color Live green/red based on which way
+    the trend it's actually predicting FROM is pointing, not the
+    probability value itself.
 
     Future: does the window AFTER NEXT continue what's forming in the
     CURRENTLY OPEN window's own live, partial, evolving data -- the
@@ -262,13 +266,14 @@ def score_continuation_live():
     feature_cols = CONTINUATION_STATE["feature_cols"]
     history = CONTINUATION_STATE["window_history"]
     if model is None or not feature_cols or len(history) < 3:
-        return None, None
+        return None, None, None
 
     import numpy as np
     block_rows = [h[0] for h in history]
     directions = [h[1] for h in history]
 
     p_live = None
+    live_trend_direction = None
     try:
         chunk_ids = segment_chunks(directions)
         feature_rows = build_lookback_features(block_rows, directions, chunk_ids)
@@ -276,6 +281,7 @@ def score_continuation_live():
             last_row = feature_rows[-1]
             X = np.array([[last_row.get(c, np.nan) for c in feature_cols]], dtype=float)
             p_live = float(model.predict_proba(X)[0, 1])
+            live_trend_direction = "up" if last_row["chunk_direction"] > 0 else "down"
     except Exception as e:
         log.warning(f"[continuation] live scoring failed: {e}")
 
@@ -301,7 +307,7 @@ def score_continuation_live():
     except Exception as e:
         log.warning(f"[continuation] future scoring failed: {e}")
 
-    return p_live, p_future
+    return p_live, p_future, live_trend_direction
 
 
 def load_models():
@@ -730,7 +736,9 @@ async def live():
             log.warning(f"[serving] feature-row build failed: {e}")
 
     if CONTINUATION_STATE["model"] is not None:
-        p_live, p_future = score_continuation_live()
-        result["continuation"] = {"p_live": p_live, "p_future": p_future}
+        p_live, p_future, live_trend_direction = score_continuation_live()
+        result["continuation"] = {
+            "p_live": p_live, "p_future": p_future, "live_trend_direction": live_trend_direction,
+        }
 
     return result
