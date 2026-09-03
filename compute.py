@@ -11,6 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from collections import deque
 import numpy as np
+import pandas as pd  # only needed by the block-level (compute_block_summary
+                       # and friends) functions added later in this file --
+                       # everything else here is deliberately pandas-free
+                       # for low-overhead per-tick live scoring
 
 
 @dataclass
@@ -569,3 +573,231 @@ def compute_kalshi_momentum_features(kalshi_series: RollingSeries, now_ts: float
         if m is not None:
             row[col_name] = m
     return row
+IMBALANCE_TIER_CUTOFFS = (0.6, 0.2)  # heavy at +-0.6, medium at +-0.2, per explicit confirmation
+
+
+def _imbalance_tier(value: float) -> str | None:
+    """Classifies a single book_imbalance reading into one of six tiers.
+    Returns None for NaN rather than guessing a tier."""
+    if pd.isna(value):
+        return None
+    heavy, medium = IMBALANCE_TIER_CUTOFFS
+    if value >= heavy:
+        return "heavy_pos"
+    elif value >= medium:
+        return "medium_pos"
+    elif value >= 0.0:
+        return "light_pos"
+    elif value >= -medium:
+        return "light_neg"
+    elif value >= -heavy:
+        return "medium_neg"
+    else:
+        return "heavy_neg"
+
+
+TIER_NAMES = ["heavy_pos", "medium_pos", "light_pos", "light_neg", "medium_neg", "heavy_neg"]
+
+
+def compute_block_summary(window_id: str, ticks: list, strike_price: float,
+                           sub_bucket_seconds: float = 15.0) -> dict | None:
+    """Summarizes ONE 15-minute block (window) into a fixed-width feature
+    row: VWAP-style price, volume, a book-imbalance TIER PROFILE (% of 15s
+    sub-buckets in each of six tiers, chosen over a plain average since
+    book imbalance oscillates fast and symmetrically -- a raw mean would
+    wash toward zero and hide persistent one-sided pressure), and
+    strike-relative metrics (time/mean price above vs below, cross-count
+    split front/back half, max distance either direction).
+
+    Shared between train.py (historical windows, one full pass) and
+    app.py (live serving, called on the in-progress window's own partial
+    ticks) -- moved here specifically so both use the IDENTICAL
+    computation rather than a hand-copied, driftable duplicate.
+
+    Buy/sell volume is intentionally NOT included yet -- it's only been
+    captured going forward from when that ingestion change shipped, so it
+    would be entirely missing for all historical training data.
+
+    Returns None if there's not enough tick data to summarize meaningfully
+    (fewer than 10 ticks) -- "not enough data" is a real, explicit case,
+    not a silent zero-filled row."""
+    if len(ticks) < 10:
+        return None
+
+    df = pd.DataFrame(ticks)
+    if "timestamp" not in df.columns or "price" not in df.columns:
+        return None
+
+    # DynamoDB returns all numeric values as decimal.Decimal, not float --
+    # cast EVERY numeric column used here up front, right after building
+    # the DataFrame, rather than chasing individual fields one at a time
+    # as each one happens to hit an operation Decimal doesn't support.
+    for col in ("timestamp", "price", "volume", "book_imbalance"):
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    window_start_ts = df["timestamp"].iloc[0]
+    volumes = df["volume"].fillna(0.0) if "volume" in df.columns else pd.Series([0.0] * len(df))
+    prices = df["price"].astype(float)
+
+    total_volume = float(volumes.sum())
+    vwap = float((prices * volumes).sum() / total_volume) if total_volume > 0 else float(prices.mean())
+
+    # Book-imbalance tier profile: bucket into 15s sub-buckets, classify
+    # each sub-bucket's MEAN imbalance, report % of sub-buckets per tier
+    tier_counts = {t: 0 for t in TIER_NAMES}
+    valid_bucket_count = 0
+    if "book_imbalance" in df.columns:
+        df["_sub_bucket"] = ((df["timestamp"] - window_start_ts) // sub_bucket_seconds).astype(int)
+        bucket_means = df.groupby("_sub_bucket")["book_imbalance"].mean()
+        for val in bucket_means:
+            tier = _imbalance_tier(val)
+            if tier is not None:
+                tier_counts[tier] += 1
+                valid_bucket_count += 1
+
+    tier_pct = {
+        f"imbalance_pct_{t}": (tier_counts[t] / valid_bucket_count if valid_bucket_count > 0 else np.nan)
+        for t in TIER_NAMES
+    }
+
+    # Strike-relative metrics
+    rel = prices - strike_price
+    above_mask = rel > 0
+    below_mask = rel < 0
+
+    ts_deltas = df["timestamp"].diff().fillna(0.0)
+    time_above = float(ts_deltas[above_mask].sum())
+    time_below = float(ts_deltas[below_mask].sum())
+    mean_price_above = float(prices[above_mask].mean()) if above_mask.any() else np.nan
+    mean_price_below = float(prices[below_mask].mean()) if below_mask.any() else np.nan
+    max_dist_above = float(rel[above_mask].max()) if above_mask.any() else 0.0
+    max_dist_below = float((-rel[below_mask]).max()) if below_mask.any() else 0.0
+
+    sign = np.sign(rel).replace(0, np.nan).ffill().fillna(0)
+    crosses = (sign.diff().abs() > 0).fillna(False)
+    window_duration = df["timestamp"].iloc[-1] - window_start_ts
+    front_half_mask = (df["timestamp"] - window_start_ts) < (window_duration / 2.0)
+    cross_count_front = int(crosses[front_half_mask].sum())
+    cross_count_back = int(crosses[~front_half_mask].sum())
+
+    row = {
+        "window_id": window_id,
+        "vwap": vwap,
+        "total_volume": total_volume,
+        "time_above_strike": time_above,
+        "time_below_strike": time_below,
+        "mean_price_above_strike": mean_price_above,
+        "mean_price_below_strike": mean_price_below,
+        "max_dist_above_strike": max_dist_above,
+        "max_dist_below_strike": max_dist_below,
+        "cross_count_front_half": cross_count_front,
+        "cross_count_back_half": cross_count_back,
+    }
+    row.update(tier_pct)
+    return row
+
+
+MIN_CONFIRMED_STREAK_LENGTH = 3  # per explicit confirmation
+
+
+def segment_chunks(directions: list, min_streak: int = MIN_CONFIRMED_STREAK_LENGTH) -> list:
+    """Given block directions (+1/-1) in chronological order, assigns each
+    block a chunk_id. A chunk spans from the start of one CONFIRMED (3+)
+    same-direction streak up to -- but not including -- the block where
+    the NEXT confirmed streak begins. Blocks before the very first
+    confirmed streak get chunk_id=None."""
+    n = len(directions)
+    streaks = []
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and directions[j + 1] == directions[i]:
+            j += 1
+        streaks.append((i, j - i + 1))
+        i = j + 1
+
+    confirmed_starts = [s[0] for s in streaks if s[1] >= min_streak]
+
+    chunk_id = [None] * n
+    for k, start in enumerate(confirmed_starts):
+        end = confirmed_starts[k + 1] if k + 1 < len(confirmed_starts) else n
+        for idx in range(start, end):
+            chunk_id[idx] = k
+    return chunk_id
+
+
+AGG_FIELDS = [
+    "total_volume", "time_above_strike", "time_below_strike",
+    "max_dist_above_strike", "max_dist_below_strike",
+    "cross_count_front_half", "cross_count_back_half",
+] + [f"imbalance_pct_{t}" for t in TIER_NAMES]
+
+
+def build_lookback_features(block_rows: list, directions: list, chunk_ids: list) -> list:
+    """For each block, computes a FIXED-WIDTH feature row combining:
+      own_*        -- the block's own summary (from compute_block_summary)
+      chunk_*       -- aggregates over the CURRENT chunk so far
+      prev_chunk_*  -- aggregates over the ENTIRE previous chunk
+
+    Blocks with chunk_id=None are skipped entirely."""
+    n = len(block_rows)
+    output = []
+
+    for i in range(n):
+        cid = chunk_ids[i]
+        if cid is None:
+            continue
+
+        row = {"window_id": block_rows[i]["window_id"], "direction": directions[i], "chunk_id": cid}
+        for k, v in block_rows[i].items():
+            if k not in ("window_id",):
+                row[f"own_{k}"] = v
+
+        chunk_indices_so_far = [j for j in range(n) if chunk_ids[j] == cid and j <= i]
+        row["chunk_length_so_far"] = len(chunk_indices_so_far)
+        row["chunk_direction"] = directions[chunk_indices_so_far[0]]
+        for field in AGG_FIELDS:
+            vals = [block_rows[j][field] for j in chunk_indices_so_far if field in block_rows[j]]
+            row[f"chunk_avg_{field}"] = float(np.nanmean(vals)) if vals else np.nan
+        vwaps_so_far = [block_rows[j]["vwap"] for j in chunk_indices_so_far]
+        row["chunk_net_price_move"] = vwaps_so_far[-1] - vwaps_so_far[0] if len(vwaps_so_far) > 1 else 0.0
+
+        if cid > 0:
+            prev_indices = [j for j in range(n) if chunk_ids[j] == cid - 1]
+        else:
+            prev_indices = []
+
+        if prev_indices:
+            row["prev_chunk_length"] = len(prev_indices)
+            row["prev_chunk_direction"] = directions[prev_indices[0]]
+            for field in AGG_FIELDS:
+                vals = [block_rows[j][field] for j in prev_indices if field in block_rows[j]]
+                row[f"prev_chunk_avg_{field}"] = float(np.nanmean(vals)) if vals else np.nan
+            prev_vwaps = [block_rows[j]["vwap"] for j in prev_indices]
+            row["prev_chunk_net_price_move"] = prev_vwaps[-1] - prev_vwaps[0] if len(prev_vwaps) > 1 else 0.0
+        else:
+            row["prev_chunk_length"] = np.nan
+            row["prev_chunk_direction"] = np.nan
+            for field in AGG_FIELDS:
+                row[f"prev_chunk_avg_{field}"] = np.nan
+            row["prev_chunk_net_price_move"] = np.nan
+
+        output.append(row)
+
+    return output
+
+
+def compute_continuation_labels(directions: list) -> list:
+    """label[i] = 1 if directions[i+1] == directions[i] (continuation), 0
+    if it flips (reversal). NaN for the last block."""
+    n = len(directions)
+    labels = []
+    for i in range(n):
+        if i == n - 1:
+            labels.append(np.nan)
+        else:
+            labels.append(1.0 if directions[i + 1] == directions[i] else 0.0)
+    return labels

@@ -33,8 +33,12 @@ from window_utils import window_id_for, seconds_remaining
 from compute import (
     Tick, RollingBuffer, compute_feature_snapshot, compute_mean_surge_indicator,
     build_live_feature_row, RollingSeries, compute_price_diff_deviation_features,
-    compute_kalshi_momentum_features,
+    compute_kalshi_momentum_features, book_imbalance,
+    compute_block_summary, segment_chunks, build_lookback_features,
 )
+from dynamo_client import list_closed_windows
+import boto3
+from boto3.dynamodb.conditions import Key
 from order_book import OrderBook
 from jwt_auth import build_ws_jwt
 from kraken_order_book import KrakenOrderBook
@@ -102,9 +106,21 @@ STATE = {
     "buf": RollingBuffer(max_seconds=900),
     "window_id": None,
     "strike_price": None,
-    "flip_model": None,
     "strike_cross_model": None,
     "feature_cols": [],
+}
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+ORDER_BOOK_FIX_CUTOFF_TS = 1787118936.0  # matches train.py -- 2026-08-19T05:55:36+00:00 UTC
+CONTINUATION_HISTORY_SIZE = 30  # recent CLOSED windows kept for chunk/lookback context
+CONTINUATION_REFRESH_INTERVAL_SEC = 300.0  # window outcomes only change once per 15 min,
+                                             # no need to refetch on every /live poll
+
+CONTINUATION_STATE = {
+    "model": None,
+    "feature_cols": None,
+    "window_history": [],  # list of (block_summary_dict, direction) tuples, chronological
+    "last_refresh_ts": 0.0,
 }
 
 KRAKEN_STATE = {
@@ -150,21 +166,155 @@ PRICE_DIFF_STATE = {
 }
 
 
+def get_generic_window_ticks(table_name: str, window_id: str) -> list:
+    """Same query pattern as train.py's function of the same name --
+    duplicated here rather than imported since it's a tiny, self-contained
+    boto3 query with no shared logic worth factoring out across the
+    training/serving process boundary."""
+    dynamodb = boto3.resource("dynamodb", region_name=REGION)
+    table = dynamodb.Table(table_name)
+    items = []
+    resp = table.query(KeyConditionExpression=Key("window_id").eq(window_id))
+    items.extend(resp["Items"])
+    while "LastEvaluatedKey" in resp:
+        resp = table.query(
+            KeyConditionExpression=Key("window_id").eq(window_id),
+            ExclusiveStartKey=resp["LastEvaluatedKey"],
+        )
+        items.extend(resp["Items"])
+    return sorted(items, key=lambda x: float(x["timestamp"]))
+
+
+def refresh_continuation_history():
+    """Fetches the last CONTINUATION_HISTORY_SIZE CLOSED windows, computes
+    each one's block summary + direction, and stores the result for live
+    Live/Future scoring. Synchronous/blocking -- always called via
+    run_in_executor so it never freezes the shared event loop the
+    WebSocket feeds depend on."""
+    try:
+        windows = list_closed_windows(region_name=REGION)
+        windows = [w for w in windows if w.get("source") != "backfill"]
+        windows = [
+            w for w in windows
+            if datetime.fromisoformat(w["window_id"]).timestamp() + 900.0 > ORDER_BOOK_FIX_CUTOFF_TS
+        ]
+        windows = sorted(windows, key=lambda w: w["window_id"])[-CONTINUATION_HISTORY_SIZE:]
+
+        history = []
+        for w in windows:
+            ticks = get_generic_window_ticks("btc_ticks", w["window_id"])
+            if not ticks:
+                continue
+            ticks_sorted = sorted(ticks, key=lambda t: float(t["timestamp"]))
+            strike_price = float(ticks_sorted[0]["price"])
+            summary = compute_block_summary(w["window_id"], ticks_sorted, strike_price)
+            if summary is None:
+                continue
+            true_outcome = w.get("kalshi_true_outcome")
+            outcome = true_outcome or w.get("outcome")
+            history.append((summary, 1 if outcome == "up" else -1))
+
+        CONTINUATION_STATE["window_history"] = history
+        CONTINUATION_STATE["last_refresh_ts"] = time.time()
+        log.info(f"[continuation] refreshed window history: {len(history)} closed windows summarized")
+    except Exception as e:
+        log.warning(f"[continuation] history refresh failed: {e}")
+
+
+async def continuation_history_refresh_loop():
+    loop = asyncio.get_event_loop()
+    while True:
+        await loop.run_in_executor(None, refresh_continuation_history)
+        await asyncio.sleep(CONTINUATION_REFRESH_INTERVAL_SEC)
+
+
+def compute_live_block_summary(buf, window_id: str, window_start_ts: float, strike_price: float):
+    """Builds the SAME dict shape compute_block_summary expects, from the
+    LIVE, in-progress tick buffer -- filtered to only this window's own
+    ticks so far. Reuses book_imbalance() (the exact same function used
+    at ingestion/training time) per tick, rather than reimplementing the
+    formula, to avoid any risk of live/train skew."""
+    ticks_in_window = [t for t in buf.ticks if t.ts >= window_start_ts]
+    if len(ticks_in_window) < 10:
+        return None
+    tick_dicts = [
+        {"timestamp": t.ts, "price": t.price, "volume": t.volume or 0.0, "book_imbalance": book_imbalance(t)}
+        for t in ticks_in_window
+    ]
+    return compute_block_summary(window_id, tick_dicts, strike_price)
+
+
+def score_continuation_live():
+    """Returns (p_live, p_future).
+
+    Live: does the CURRENTLY OPEN window continue the trend established
+    by the last CLOSED window -- built entirely from settled, ground-
+    truth history. Stable; only changes once every 15 minutes, right
+    when a window closes.
+
+    Future: does the window AFTER NEXT continue what's forming in the
+    CURRENTLY OPEN window's own live, partial, evolving data -- the
+    currently-open window is appended as a PROVISIONAL entry, with its
+    direction INFERRED from current price vs. its own strike (an
+    approximation, since it hasn't actually settled yet). Updates
+    continuously as the window's own data accumulates."""
+    model = CONTINUATION_STATE["model"]
+    feature_cols = CONTINUATION_STATE["feature_cols"]
+    history = CONTINUATION_STATE["window_history"]
+    if model is None or not feature_cols or len(history) < 3:
+        return None, None
+
+    import numpy as np
+    block_rows = [h[0] for h in history]
+    directions = [h[1] for h in history]
+
+    p_live = None
+    try:
+        chunk_ids = segment_chunks(directions)
+        feature_rows = build_lookback_features(block_rows, directions, chunk_ids)
+        if feature_rows:
+            last_row = feature_rows[-1]
+            X = np.array([[last_row.get(c, np.nan) for c in feature_cols]], dtype=float)
+            p_live = float(model.predict_proba(X)[0, 1])
+    except Exception as e:
+        log.warning(f"[continuation] live scoring failed: {e}")
+
+    p_future = None
+    try:
+        if STATE["window_id"] is not None and STATE["strike_price"] is not None:
+            window_start_ts = datetime.fromisoformat(STATE["window_id"]).timestamp()
+            live_summary = compute_live_block_summary(
+                STATE["buf"], STATE["window_id"], window_start_ts, STATE["strike_price"],
+            )
+            if live_summary is not None:
+                inferred_direction = 1 if live_summary["vwap"] >= STATE["strike_price"] else -1
+                provisional_rows = block_rows + [live_summary]
+                provisional_directions = directions + [inferred_direction]
+                provisional_chunk_ids = segment_chunks(provisional_directions)
+                provisional_features = build_lookback_features(
+                    provisional_rows, provisional_directions, provisional_chunk_ids,
+                )
+                if provisional_features:
+                    future_row = provisional_features[-1]
+                    X2 = np.array([[future_row.get(c, np.nan) for c in feature_cols]], dtype=float)
+                    p_future = float(model.predict_proba(X2)[0, 1])
+    except Exception as e:
+        log.warning(f"[continuation] future scoring failed: {e}")
+
+    return p_live, p_future
+
+
 def load_models():
     """NOTE: directional model intentionally not loaded/served anymore --
-    settlement prediction was scrapped in favor of reversal and
-    strike-crossing, both of which ask more directly trade-relevant
-    questions than "where will price settle"."""
+    settlement prediction was scrapped in favor of strike-crossing and
+    block-level continuation. reversal (flip_model) is also no longer
+    loaded/served -- confirmed at chance-level AUC (~0.50) across two
+    separate full training runs on real data, meaning a probability from
+    it would look like a real signal without actually being one."""
     feature_cols = []
     if os.path.exists(FEATURE_COLS_PATH):
         with open(FEATURE_COLS_PATH) as f:
             feature_cols = json.load(f).get("feature_cols", [])
-
-    flip_model = None
-    fpath = os.path.join(ARTIFACT_DIR, "flip_model.json")
-    if os.path.exists(fpath):
-        flip_model = xgb.XGBClassifier()
-        flip_model.load_model(fpath)
 
     strike_cross_model = None
     scpath = os.path.join(ARTIFACT_DIR, "strike_cross_model.json")
@@ -172,10 +322,22 @@ def load_models():
         strike_cross_model = xgb.XGBClassifier()
         strike_cross_model.load_model(scpath)
 
-    STATE["flip_model"] = flip_model
+    continuation_model = None
+    continuation_feature_cols = None
+    cpath = os.path.join(ARTIFACT_DIR, "continuation_model.json")
+    if os.path.exists(cpath):
+        continuation_model = xgb.XGBClassifier()
+        continuation_model.load_model(cpath)
+        if os.path.exists(FEATURE_COLS_PATH):
+            with open(FEATURE_COLS_PATH) as f:
+                continuation_feature_cols = json.load(f).get("continuation_feature_cols")
+
     STATE["strike_cross_model"] = strike_cross_model
     STATE["feature_cols"] = feature_cols
-    log.info(f"Models loaded: flip={flip_model is not None} strike_cross={strike_cross_model is not None}")
+    CONTINUATION_STATE["model"] = continuation_model
+    CONTINUATION_STATE["feature_cols"] = continuation_feature_cols
+    log.info(f"Models loaded: strike_cross={strike_cross_model is not None} "
+             f"continuation={continuation_model is not None}")
 
 
 async def feed_loop():
@@ -449,6 +611,7 @@ async def startup():
     asyncio.create_task(kraken_feed_loop())
     asyncio.create_task(kalshi_poll_loop())
     asyncio.create_task(cryptocom_feed_loop())
+    asyncio.create_task(continuation_history_refresh_loop())
 
 
 @app.get("/health")
@@ -474,9 +637,8 @@ async def live():
         "current_price": feats.get("price"),
         "seconds_remaining": secs_remaining,
         "features": feats,
-        "flip": None,
         "strike_cross": None,
-        "kalshi_trend": None,
+        "continuation": None,
         "mean_surge": None,
         "kraken": None,
         "kalshi_strike": KALSHI_STATE["strike"],
@@ -534,7 +696,7 @@ async def live():
     # XGBoost handles missing values natively rather than refusing to
     # score at all, which is what the original all-or-nothing gate did.
     cols = STATE["feature_cols"]
-    if cols and (STATE["flip_model"] is not None or STATE["strike_cross_model"] is not None):
+    if cols and STATE["strike_cross_model"] is not None:
         try:
             import numpy as np
             row_dict = build_live_feature_row(
@@ -556,34 +718,19 @@ async def live():
             )
             row_dict.update(kalshi_momentum_row)
 
-            # Surface the current trend direction the reversal model is
-            # actually using -- reversal probability is symmetric by
-            # design (it's P(reverses against WHATEVER the current
-            # direction is)), so the raw number alone can't tell you
-            # which direction "current" means. Same feature the model
-            # itself trained the reversal label against, not a separate
-            # recomputation.
-            m15 = kalshi_momentum_row.get("kalshi_momentum_15s")
-            if m15 is not None:
-                result["kalshi_trend"] = "up" if m15 > 0 else ("down" if m15 < 0 else "flat")
-
             row = [[row_dict.get(c, np.nan) for c in cols]]
             X = np.array(row, dtype=float)
 
-            if STATE["flip_model"] is not None:
-                try:
-                    p_reversal = float(STATE["flip_model"].predict_proba(X)[0, 1])
-                    result["flip"] = {"p_flip": p_reversal}
-                except Exception as e:
-                    result["flip"] = {"error": str(e)}
-
-            if STATE["strike_cross_model"] is not None:
-                try:
-                    p_cross = float(STATE["strike_cross_model"].predict_proba(X)[0, 1])
-                    result["strike_cross"] = {"p_cross": p_cross}
-                except Exception as e:
-                    result["strike_cross"] = {"error": str(e)}
+            try:
+                p_cross = float(STATE["strike_cross_model"].predict_proba(X)[0, 1])
+                result["strike_cross"] = {"p_cross": p_cross}
+            except Exception as e:
+                result["strike_cross"] = {"error": str(e)}
         except Exception as e:
             log.warning(f"[serving] feature-row build failed: {e}")
+
+    if CONTINUATION_STATE["model"] is not None:
+        p_live, p_future = score_continuation_live()
+        result["continuation"] = {"p_live": p_live, "p_future": p_future}
 
     return result
