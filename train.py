@@ -994,10 +994,23 @@ def compute_block_summary(window_id: str, ticks: list[dict], strike_price: float
     df = pd.DataFrame(ticks)
     if "timestamp" not in df.columns or "price" not in df.columns:
         return None
+
+    # DynamoDB returns all numeric values as decimal.Decimal, not float --
+    # cast EVERY numeric column used here up front, right after building
+    # the DataFrame, rather than chasing individual fields one at a time
+    # as each one happens to hit an operation Decimal doesn't support
+    # (confirmed twice now: volume/book_imbalance via explicit float
+    # multiplication, timestamp via division -- other operations like
+    # subtraction between two Decimals succeed silently, which is exactly
+    # why this wasn't caught everywhere at once).
+    for col in ("timestamp", "price", "volume", "book_imbalance"):
+        if col in df.columns:
+            df[col] = df[col].astype(float)
+
     df = df.sort_values("timestamp").reset_index(drop=True)
 
     window_start_ts = df["timestamp"].iloc[0]
-    volumes = df["volume"].astype(float).fillna(0.0) if "volume" in df.columns else pd.Series([0.0] * len(df))
+    volumes = df["volume"].fillna(0.0) if "volume" in df.columns else pd.Series([0.0] * len(df))
     prices = df["price"].astype(float)
 
     total_volume = float(volumes.sum())
@@ -1009,7 +1022,7 @@ def compute_block_summary(window_id: str, ticks: list[dict], strike_price: float
     valid_bucket_count = 0
     if "book_imbalance" in df.columns:
         df["_sub_bucket"] = ((df["timestamp"] - window_start_ts) // sub_bucket_seconds).astype(int)
-        bucket_means = df.groupby("_sub_bucket")["book_imbalance"].apply(lambda s: s.astype(float).mean())
+        bucket_means = df.groupby("_sub_bucket")["book_imbalance"].mean()
         for val in bucket_means:
             tier = _imbalance_tier(val)
             if tier is not None:
