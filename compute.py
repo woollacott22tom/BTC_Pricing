@@ -700,33 +700,68 @@ def compute_block_summary(window_id: str, ticks: list, strike_price: float,
     return row
 
 
-MIN_CONFIRMED_STREAK_LENGTH = 3  # per explicit confirmation
+LOOKBACK_BLOCKS = 15  # default trailing lookback window for aggregate
+                       # features -- replaces the earlier confirmed-streak
+                       # (chunk) based aggregation entirely, per explicit
+                       # decision: chunking required retroactive
+                       # confirmation (wait to see if a streak reaches 3+),
+                       # which both leaked hindsight into training and
+                       # went stale in live serving. A fixed trailing
+                       # window needs no confirmation at all -- every
+                       # block gets a well-defined lookback average using
+                       # only what already happened before it.
+MIN_LOOKBACK_BLOCKS = 3  # minimum prior blocks required for a non-NaN
+                          # lookback average -- same min_periods-style
+                          # honesty pattern used elsewhere in this file
 
 
-def segment_chunks(directions: list, min_streak: int = MIN_CONFIRMED_STREAK_LENGTH) -> list:
-    """Given block directions (+1/-1) in chronological order, assigns each
-    block a chunk_id. A chunk spans from the start of one CONFIRMED (3+)
-    same-direction streak up to -- but not including -- the block where
-    the NEXT confirmed streak begins. Blocks before the very first
-    confirmed streak get chunk_id=None."""
+def compute_next_streak_length(prev_streak_length, prev_direction, new_direction) -> int:
+    """The core, incremental derivation rule: given the IMMEDIATELY
+    PRECEDING window's PERSISTED streak_length + direction, derives the
+    new window's streak_length -- 0 on a reversal, prev+1 on a
+    continuation. prev_streak_length/prev_direction=None means no
+    preceding window has ever been processed (the very first window in
+    the entire dataset's history, a one-time-ever case) -- treated as 0.
+
+    This is the ONLY place streak_length logic lives -- both the full-
+    sequence version below (training, chronological) and live serving's
+    single-step case build on this exact same rule, so they can never
+    silently diverge. Critically, this means streak_length should be
+    PERSISTED (see train.py's DynamoDB write-back) rather than re-derived
+    from whatever's visible in a limited live buffer -- re-deriving from
+    a bounded buffer risks understating a real streak that started
+    earlier than that buffer's visibility, especially right after a live
+    service restart. Reading the true prior value instead makes this an
+    O(1) lookup with no such risk, regardless of how long the real streak
+    actually is."""
+    if prev_streak_length is None or prev_direction is None:
+        return 0
+    if new_direction != prev_direction:
+        return 0
+    return prev_streak_length + 1
+
+
+def compute_streak_length(directions: list) -> list:
+    """Full-sequence version, for training's chronological processing --
+    each value derived via compute_next_streak_length from the position
+    immediately before it. The very first block in the given sequence is
+    treated as an implicit fresh start (see compute_next_streak_length),
+    which is exactly correct for the true first window in the entire
+    dataset's history, and a harmless one-time approximation anywhere
+    else a sequence might start mid-stream.
+
+    Deliberately requires no confirmation/minimum length at all -- 0 and
+    1 are valid, meaningful values, not excluded. The goal is general
+    pattern-finding across every transition, not streak prediction
+    specifically; gating on streak length would bias toward exactly the
+    pattern this is not meant to isolate."""
     n = len(directions)
-    streaks = []
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and directions[j + 1] == directions[i]:
-            j += 1
-        streaks.append((i, j - i + 1))
-        i = j + 1
-
-    confirmed_starts = [s[0] for s in streaks if s[1] >= min_streak]
-
-    chunk_id = [None] * n
-    for k, start in enumerate(confirmed_starts):
-        end = confirmed_starts[k + 1] if k + 1 < len(confirmed_starts) else n
-        for idx in range(start, end):
-            chunk_id[idx] = k
-    return chunk_id
+    lengths = [None] * n
+    for i in range(n):
+        prev_length = lengths[i - 1] if i > 0 else None
+        prev_direction = directions[i - 1] if i > 0 else None
+        lengths[i] = compute_next_streak_length(prev_length, prev_direction, directions[i])
+    return lengths
 
 
 AGG_FIELDS = [
@@ -736,54 +771,83 @@ AGG_FIELDS = [
 ] + [f"imbalance_pct_{t}" for t in TIER_NAMES]
 
 
-def build_lookback_features(block_rows: list, directions: list, chunk_ids: list) -> list:
-    """For each block, computes a FIXED-WIDTH feature row combining:
-      own_*        -- the block's own summary (from compute_block_summary)
-      chunk_*       -- aggregates over the CURRENT chunk so far
-      prev_chunk_*  -- aggregates over the ENTIRE previous chunk
+def build_lookback_features(block_rows: list, directions: list,
+                             lookback_blocks: int = LOOKBACK_BLOCKS,
+                             min_lookback: int = MIN_LOOKBACK_BLOCKS) -> list:
+    """For EVERY block (no exclusion at all -- see compute_streak_length's
+    docstring for why), computes a fixed-width feature row combining:
+      own_*                 -- the block's own summary (from compute_block_summary)
+      direction              -- this block's own direction
+      streak_length          -- see compute_streak_length
+      own_{field}_lag{k}     -- for k=1..lookback_blocks, that SPECIFIC
+                                prior block's own value for each field (k=1
+                                is the immediately preceding block) -- lets
+                                the model see the actual SHAPE of the last
+                                N blocks (climbing into a spike vs. flat,
+                                oscillating vs. one-directional), not just
+                                a single collapsed average. NaN wherever
+                                that specific lag doesn't exist yet
+                                (independent of min_lookback -- an
+                                individual lag is either available or it
+                                isn't, unlike an average which needs a
+                                minimum sample to be meaningful).
+      lookback_avg_*         -- average of each AGG_FIELD over the trailing
+                                lookback_blocks blocks BEFORE this one --
+                                kept alongside the raw lags as a cheap,
+                                robust summary a tree-based model can use
+                                directly without needing to reconstruct it
+                                from 15 separate lag features itself.
+      lookback_length        -- how many prior blocks actually existed
+                                (may be less than lookback_blocks near the
+                                start of the sequence)
+      lookback_net_price_move -- VWAP change across the lookback window
 
-    Blocks with chunk_id=None are skipped entirely."""
+    Every row is included. No confirmation gate, no streak-length
+    minimum -- 0 and 1 are valid, meaningful values here, not excluded.
+
+    Honest tradeoff worth knowing: this adds lookback_blocks * (len(AGG_FIELDS)+1)
+    columns (210 at the current defaults -- 15 lags x 14 fields) on top of
+    everything else -- a real increase in feature count relative to a
+    training set that's currently on the order of 1000-1500 rows, raising
+    genuine overfitting risk. Verified for correctness here; not a claim
+    that more features automatically means a better model."""
     n = len(block_rows)
+    streak_lengths = compute_streak_length(directions)
+    lagged_fields = AGG_FIELDS + ["vwap"]
     output = []
 
     for i in range(n):
-        cid = chunk_ids[i]
-        if cid is None:
-            continue
-
-        row = {"window_id": block_rows[i]["window_id"], "direction": directions[i], "chunk_id": cid}
+        row = {
+            "window_id": block_rows[i]["window_id"],
+            "direction": directions[i],
+            "streak_length": streak_lengths[i],
+        }
         for k, v in block_rows[i].items():
-            if k not in ("window_id",):
+            if k != "window_id":
                 row[f"own_{k}"] = v
 
-        chunk_indices_so_far = [j for j in range(n) if chunk_ids[j] == cid and j <= i]
-        row["chunk_length_so_far"] = len(chunk_indices_so_far)
-        row["chunk_direction"] = directions[chunk_indices_so_far[0]]
-        for field in AGG_FIELDS:
-            vals = [block_rows[j][field] for j in chunk_indices_so_far if field in block_rows[j]]
-            row[f"chunk_avg_{field}"] = float(np.nanmean(vals)) if vals else np.nan
-        vwaps_so_far = [block_rows[j]["vwap"] for j in chunk_indices_so_far]
-        row["chunk_net_price_move"] = vwaps_so_far[-1] - vwaps_so_far[0] if len(vwaps_so_far) > 1 else 0.0
+        # Per-position lags -- each lag is independently available or not,
+        # regardless of min_lookback (that threshold is specifically an
+        # AVERAGE's minimum sample size, not a per-lag requirement).
+        for lag in range(1, lookback_blocks + 1):
+            src_idx = i - lag
+            for field in lagged_fields:
+                row[f"own_{field}_lag{lag}"] = block_rows[src_idx].get(field, np.nan) if src_idx >= 0 else np.nan
 
-        if cid > 0:
-            prev_indices = [j for j in range(n) if chunk_ids[j] == cid - 1]
-        else:
-            prev_indices = []
+        lookback_start = max(0, i - lookback_blocks)
+        lookback_indices = list(range(lookback_start, i))
+        row["lookback_length"] = len(lookback_indices)
 
-        if prev_indices:
-            row["prev_chunk_length"] = len(prev_indices)
-            row["prev_chunk_direction"] = directions[prev_indices[0]]
+        if len(lookback_indices) >= min_lookback:
             for field in AGG_FIELDS:
-                vals = [block_rows[j][field] for j in prev_indices if field in block_rows[j]]
-                row[f"prev_chunk_avg_{field}"] = float(np.nanmean(vals)) if vals else np.nan
-            prev_vwaps = [block_rows[j]["vwap"] for j in prev_indices]
-            row["prev_chunk_net_price_move"] = prev_vwaps[-1] - prev_vwaps[0] if len(prev_vwaps) > 1 else 0.0
+                vals = [block_rows[j][field] for j in lookback_indices if field in block_rows[j]]
+                row[f"lookback_avg_{field}"] = float(np.nanmean(vals)) if vals else np.nan
+            lookback_vwaps = [block_rows[j]["vwap"] for j in lookback_indices]
+            row["lookback_net_price_move"] = lookback_vwaps[-1] - lookback_vwaps[0] if len(lookback_vwaps) > 1 else 0.0
         else:
-            row["prev_chunk_length"] = np.nan
-            row["prev_chunk_direction"] = np.nan
             for field in AGG_FIELDS:
-                row[f"prev_chunk_avg_{field}"] = np.nan
-            row["prev_chunk_net_price_move"] = np.nan
+                row[f"lookback_avg_{field}"] = np.nan
+            row["lookback_net_price_move"] = np.nan
 
         output.append(row)
 
