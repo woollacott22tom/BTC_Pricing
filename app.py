@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+from decimal import Decimal
 from datetime import datetime, timezone
 
 import websockets
@@ -34,7 +35,7 @@ from compute import (
     Tick, RollingBuffer, compute_feature_snapshot, compute_mean_surge_indicator,
     build_live_feature_row, RollingSeries, compute_price_diff_deviation_features,
     compute_kalshi_momentum_features, book_imbalance,
-    compute_block_summary, segment_chunks, build_lookback_features,
+    compute_block_summary, build_lookback_features, compute_next_streak_length,
 )
 from dynamo_client import list_closed_windows
 import boto3
@@ -112,15 +113,23 @@ STATE = {
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ORDER_BOOK_FIX_CUTOFF_TS = 1787118936.0  # matches train.py -- 2026-08-19T05:55:36+00:00 UTC
-CONTINUATION_HISTORY_SIZE = 30  # recent CLOSED windows kept for chunk/lookback context
-CONTINUATION_REFRESH_INTERVAL_SEC = 300.0  # window outcomes only change once per 15 min,
-                                             # no need to refetch on every /live poll
+CONTINUATION_HISTORY_SIZE = 30  # recent CLOSED windows kept for lookback context --
+                                  # updated incrementally on each window close, not polled
 
 CONTINUATION_STATE = {
     "model": None,
     "feature_cols": None,
     "window_history": [],  # list of (block_summary_dict, direction) tuples, chronological
     "last_refresh_ts": 0.0,
+    # Authoritative streak_length tracking -- PERSISTED via DynamoDB, not
+    # re-derived from window_history's limited buffer. See
+    # compute_next_streak_length's docstring for why this matters: a
+    # buffer-derived value could understate a real streak that started
+    # earlier than the buffer's visibility, especially right after a
+    # restart. These two are seeded from the last window's PERSISTED
+    # value at startup and updated incrementally from there.
+    "last_streak_length": None,
+    "last_streak_direction": None,
 }
 
 KRAKEN_STATE = {
@@ -185,12 +194,50 @@ def get_generic_window_ticks(table_name: str, window_id: str) -> list:
     return sorted(items, key=lambda x: float(x["timestamp"]))
 
 
+def get_window_streak_length(window_id: str) -> int | None:
+    """Reads a window's PERSISTED streak_length attribute directly --
+    None if it was never written (e.g. a window from before this
+    persistence mechanism existed). Used to seed live tracking correctly
+    at startup, rather than re-deriving from whatever's visible in the
+    initial history buffer."""
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=REGION)
+        table = dynamodb.Table("btc_windows")
+        resp = table.get_item(Key={"window_id": window_id})
+        item = resp.get("Item")
+        if item is None or "streak_length" not in item:
+            return None
+        return int(item["streak_length"])
+    except Exception as e:
+        log.warning(f"[continuation] failed to read persisted streak_length for {window_id}: {e}")
+        return None
+
+
+def update_window_streak_length(window_id: str, streak_length: int) -> None:
+    """Persists the computed streak_length back to the window's own
+    btc_windows record -- see compute_next_streak_length's docstring for
+    why this matters. Same targeted update as train.py's write-back."""
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name=REGION)
+        table = dynamodb.Table("btc_windows")
+        table.update_item(
+            Key={"window_id": window_id},
+            UpdateExpression="SET streak_length = :sl",
+            ExpressionAttributeValues={":sl": Decimal(str(streak_length))},
+        )
+    except Exception as e:
+        log.warning(f"[continuation] failed to persist streak_length for {window_id}: {e}")
+
+
 def refresh_continuation_history():
     """Fetches the last CONTINUATION_HISTORY_SIZE CLOSED windows, computes
     each one's block summary + direction, and stores the result for live
-    Live/Future scoring. Synchronous/blocking -- always called via
-    run_in_executor so it never freezes the shared event loop the
-    WebSocket feeds depend on."""
+    Live/Future scoring. Synchronous/blocking -- called via run_in_executor
+    so it never freezes the shared event loop the WebSocket feeds depend
+    on. Called ONCE at startup only, to populate initial history from
+    cold start -- after that, append_closed_window_to_continuation_history
+    updates it incrementally, right when each window actually closes,
+    rather than re-fetching and re-summarizing all 30 windows on a timer."""
     try:
         windows = list_closed_windows(region_name=REGION)
         windows = [w for w in windows if w.get("source") != "backfill"]
@@ -216,16 +263,99 @@ def refresh_continuation_history():
 
         CONTINUATION_STATE["window_history"] = history
         CONTINUATION_STATE["last_refresh_ts"] = time.time()
-        log.info(f"[continuation] refreshed window history: {len(history)} closed windows summarized")
+        log.info(f"[continuation] initial history populated: {len(history)} closed windows summarized")
+
+        # Seed authoritative streak tracking from the LAST window's
+        # PERSISTED value, not derived from this (bounded) history buffer
+        # -- reading the true prior value avoids understating a real
+        # streak that started earlier than these last CONTINUATION_HISTORY_SIZE
+        # windows can see.
+        if history:
+            last_window_id, last_direction = windows[-1]["window_id"], history[-1][1]
+            persisted_sl = get_window_streak_length(last_window_id)
+            if persisted_sl is not None:
+                CONTINUATION_STATE["last_streak_length"] = persisted_sl
+                CONTINUATION_STATE["last_streak_direction"] = last_direction
+                log.info(f"[continuation] seeded streak tracking from persisted value: "
+                          f"{last_window_id} streak_length={persisted_sl}")
+            else:
+                log.warning(f"[continuation] no persisted streak_length found for {last_window_id} "
+                             f"(expected if the next training run with the write-back hasn't happened "
+                             f"yet) -- streak tracking will start fresh from the next window close")
     except Exception as e:
-        log.warning(f"[continuation] history refresh failed: {e}")
+        log.warning(f"[continuation] initial history population failed: {e}")
 
 
-async def continuation_history_refresh_loop():
-    loop = asyncio.get_event_loop()
-    while True:
-        await loop.run_in_executor(None, refresh_continuation_history)
-        await asyncio.sleep(CONTINUATION_REFRESH_INTERVAL_SEC)
+def _fetch_and_summarize_one_window(window_id: str) -> dict | None:
+    """Blocking. Fetches and summarizes exactly ONE window's own ticks --
+    the cheap, incremental alternative to refresh_continuation_history's
+    full 30-window re-fetch. Called via run_in_executor."""
+    ticks = get_generic_window_ticks("btc_ticks", window_id)
+    if not ticks:
+        return None
+    ticks_sorted = sorted(ticks, key=lambda t: float(t["timestamp"]))
+    strike_price = float(ticks_sorted[0]["price"])
+    return compute_block_summary(window_id, ticks_sorted, strike_price)
+
+
+async def append_closed_window_to_continuation_history(closed_window_id: str):
+    """Event-driven update, triggered exactly when a window closes (see
+    the window-rollover detection in feed_loop) -- appends that ONE
+    newly-closed window's summary to the rolling history and drops the
+    oldest entry once over CONTINUATION_HISTORY_SIZE. Replaces the old
+    5-minute full re-fetch-of-30-windows poll: cheaper (one window's
+    ticks, not thirty), and never stale between polls, since it fires the
+    moment new data actually exists rather than on a fixed timer."""
+    try:
+        loop = asyncio.get_event_loop()
+        summary = await loop.run_in_executor(None, _fetch_and_summarize_one_window, closed_window_id)
+        if summary is None:
+            log.warning(f"[continuation] could not summarize just-closed window {closed_window_id}")
+            return
+
+        # Real settlement outcome for this specific window, preferring
+        # Kalshi's own reconciled result the same way training does --
+        # falls back to our own observed outcome (which side of the
+        # window's own strike price ended up on) if reconciliation
+        # hasn't run yet for this window.
+        windows = await loop.run_in_executor(None, lambda: list_closed_windows(region_name=REGION))
+        match = next((w for w in windows if w["window_id"] == closed_window_id), None)
+        if match is not None:
+            true_outcome = match.get("kalshi_true_outcome")
+            outcome = true_outcome or match.get("outcome")
+        else:
+            outcome = None
+
+        if outcome is None:
+            log.warning(f"[continuation] no outcome found for {closed_window_id} -- skipping append")
+            return
+
+        direction = 1 if outcome == "up" else -1
+        history = CONTINUATION_STATE["window_history"]
+        history.append((summary, direction))
+        if len(history) > CONTINUATION_HISTORY_SIZE:
+            history.pop(0)
+        CONTINUATION_STATE["window_history"] = history
+        CONTINUATION_STATE["last_refresh_ts"] = time.time()
+
+        # Derive this window's streak_length from the AUTHORITATIVE
+        # tracked prior value (persisted, not re-derived from the bounded
+        # history buffer above), persist it for this window, and advance
+        # the tracked state -- this is the O(1) mechanism that never
+        # understates a real streak regardless of how long it runs or how
+        # many restarts happen along the way.
+        new_streak_length = compute_next_streak_length(
+            CONTINUATION_STATE["last_streak_length"], CONTINUATION_STATE["last_streak_direction"], direction,
+        )
+        await loop.run_in_executor(None, update_window_streak_length, closed_window_id, new_streak_length)
+        CONTINUATION_STATE["last_streak_length"] = new_streak_length
+        CONTINUATION_STATE["last_streak_direction"] = direction
+
+        log.info(f"[continuation] appended closed window {closed_window_id} "
+                  f"(direction={'up' if direction > 0 else 'down'}, streak_length={new_streak_length}), "
+                  f"history now {len(history)} windows")
+    except Exception as e:
+        log.warning(f"[continuation] incremental append failed for {closed_window_id}: {e}")
 
 
 def compute_live_block_summary(buf, window_id: str, window_start_ts: float, strike_price: float):
@@ -245,13 +375,18 @@ def compute_live_block_summary(buf, window_id: str, window_start_ts: float, stri
 
 
 def score_continuation_live():
-    """Returns (p_live, p_future, live_trend_direction).
+    """Returns (p_live, p_future, live_trend_direction, p_settle_up, p_settle_down).
+
+    p_settle_up/p_settle_down reframe p_future as a direct settlement
+    call for the CURRENT (in-progress) block -- p_future is really
+    "P(continues in whatever direction was just inferred)", so which one
+    it maps to (up or down) depends on which direction that currently is.
 
     Live: does the CURRENTLY OPEN window continue the trend established
     by the last CLOSED window -- built entirely from settled, ground-
-    truth history. Stable; only changes once every 15 minutes, right
-    when a window closes. live_trend_direction is that established
-    trend's OWN direction (chunk_direction of the last closed window) --
+    truth history. Updated incrementally right when each window closes
+    (see append_closed_window_to_continuation_history), not on a timer.
+    live_trend_direction is that last closed window's OWN direction --
     exposed so the dashboard can color Live green/red based on which way
     the trend it's actually predicting FROM is pointing, not the
     probability value itself.
@@ -261,7 +396,11 @@ def score_continuation_live():
     currently-open window is appended as a PROVISIONAL entry, with its
     direction INFERRED from current price vs. its own strike (an
     approximation, since it hasn't actually settled yet). Updates
-    continuously as the window's own data accumulates."""
+    continuously as the window's own data accumulates.
+
+    Uses the streak_length/lagged-feature schema (compute.py) -- no more
+    chunk confirmation gate, every closed window in history contributes
+    a valid row."""
     model = CONTINUATION_STATE["model"]
     feature_cols = CONTINUATION_STATE["feature_cols"]
     history = CONTINUATION_STATE["window_history"]
@@ -275,17 +414,26 @@ def score_continuation_live():
     p_live = None
     live_trend_direction = None
     try:
-        chunk_ids = segment_chunks(directions)
-        feature_rows = build_lookback_features(block_rows, directions, chunk_ids)
+        feature_rows = build_lookback_features(block_rows, directions)
         if feature_rows:
             last_row = feature_rows[-1]
+            # Override with the AUTHORITATIVE, persisted streak_length --
+            # build_lookback_features derives it from ONLY this bounded
+            # history buffer, which can understate a real streak that
+            # started earlier than the buffer's visibility (e.g. right
+            # after a restart). The tracked value is read from/written to
+            # DynamoDB and is never subject to that limit.
+            if CONTINUATION_STATE["last_streak_length"] is not None:
+                last_row["streak_length"] = CONTINUATION_STATE["last_streak_length"]
             X = np.array([[last_row.get(c, np.nan) for c in feature_cols]], dtype=float)
             p_live = float(model.predict_proba(X)[0, 1])
-            live_trend_direction = "up" if last_row["chunk_direction"] > 0 else "down"
+            live_trend_direction = "up" if last_row["direction"] > 0 else "down"
     except Exception as e:
         log.warning(f"[continuation] live scoring failed: {e}")
 
     p_future = None
+    p_settle_up = None
+    p_settle_down = None
     try:
         if STATE["window_id"] is not None and STATE["strike_price"] is not None:
             window_start_ts = datetime.fromisoformat(STATE["window_id"]).timestamp()
@@ -296,18 +444,34 @@ def score_continuation_live():
                 inferred_direction = 1 if live_summary["vwap"] >= STATE["strike_price"] else -1
                 provisional_rows = block_rows + [live_summary]
                 provisional_directions = directions + [inferred_direction]
-                provisional_chunk_ids = segment_chunks(provisional_directions)
-                provisional_features = build_lookback_features(
-                    provisional_rows, provisional_directions, provisional_chunk_ids,
-                )
+                provisional_features = build_lookback_features(provisional_rows, provisional_directions)
                 if provisional_features:
                     future_row = provisional_features[-1]
+                    # Same override, derived correctly for this PROVISIONAL
+                    # row from the authoritative prior value.
+                    future_row["streak_length"] = compute_next_streak_length(
+                        CONTINUATION_STATE["last_streak_length"],
+                        CONTINUATION_STATE["last_streak_direction"],
+                        inferred_direction,
+                    )
                     X2 = np.array([[future_row.get(c, np.nan) for c in feature_cols]], dtype=float)
                     p_future = float(model.predict_proba(X2)[0, 1])
+
+                    # Reframed as P(settles up)/P(settles down) for the
+                    # CURRENT block, per explicit request -- p_future is
+                    # "P(continues in whatever direction was just
+                    # inferred)"; continuing an UP-inferred block means
+                    # settling up, continuing a DOWN-inferred block means
+                    # settling down, so the mapping flips based on
+                    # inferred_direction rather than always meaning "up."
+                    if inferred_direction > 0:
+                        p_settle_up, p_settle_down = p_future, 1.0 - p_future
+                    else:
+                        p_settle_down, p_settle_up = p_future, 1.0 - p_future
     except Exception as e:
         log.warning(f"[continuation] future scoring failed: {e}")
 
-    return p_live, p_future, live_trend_direction
+    return p_live, p_future, live_trend_direction, p_settle_up, p_settle_down
 
 
 def load_models():
@@ -413,9 +577,14 @@ async def feed_loop():
 
                         wid = window_id_for(now)
                         if STATE["window_id"] != wid:
+                            closed_window_id = STATE["window_id"]
                             STATE["window_id"] = wid
                             STATE["strike_price"] = last_trade_price
                             log.info(f"[serving] window rolled: {wid} strike={last_trade_price}")
+                            if closed_window_id is not None:
+                                asyncio.create_task(
+                                    append_closed_window_to_continuation_history(closed_window_id)
+                                )
 
                         last_logged = now_ts
                         pending_volume = 0.0
@@ -617,7 +786,11 @@ async def startup():
     asyncio.create_task(kraken_feed_loop())
     asyncio.create_task(kalshi_poll_loop())
     asyncio.create_task(cryptocom_feed_loop())
-    asyncio.create_task(continuation_history_refresh_loop())
+    # One-time initial population only -- after this, history updates
+    # incrementally exactly when each window closes (see feed_loop's
+    # rollover detection), not on a repeating timer.
+    loop = asyncio.get_event_loop()
+    asyncio.create_task(loop.run_in_executor(None, refresh_continuation_history))
 
 
 @app.get("/health")
@@ -736,9 +909,10 @@ async def live():
             log.warning(f"[serving] feature-row build failed: {e}")
 
     if CONTINUATION_STATE["model"] is not None:
-        p_live, p_future, live_trend_direction = score_continuation_live()
+        p_live, p_future, live_trend_direction, p_settle_up, p_settle_down = score_continuation_live()
         result["continuation"] = {
             "p_live": p_live, "p_future": p_future, "live_trend_direction": live_trend_direction,
+            "p_settle_up": p_settle_up, "p_settle_down": p_settle_down,
         }
 
     return result
