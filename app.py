@@ -789,8 +789,14 @@ async def startup():
     # One-time initial population only -- after this, history updates
     # incrementally exactly when each window closes (see feed_loop's
     # rollover detection), not on a repeating timer.
+    #
+    # run_in_executor() already returns something directly schedulable on
+    # the event loop (a Future) -- wrapping it in create_task(), which
+    # specifically requires a coroutine, raised TypeError under uvloop on
+    # every single startup, crashing the whole app every time (confirmed
+    # directly from the real crash traceback before fixing this).
     loop = asyncio.get_event_loop()
-    asyncio.create_task(loop.run_in_executor(None, refresh_continuation_history))
+    loop.run_in_executor(None, refresh_continuation_history)
 
 
 @app.get("/health")
