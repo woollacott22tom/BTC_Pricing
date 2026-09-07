@@ -375,12 +375,7 @@ def compute_live_block_summary(buf, window_id: str, window_start_ts: float, stri
 
 
 def score_continuation_live():
-    """Returns (p_live, p_future, live_trend_direction, p_settle_up, p_settle_down).
-
-    p_settle_up/p_settle_down reframe p_future as a direct settlement
-    call for the CURRENT (in-progress) block -- p_future is really
-    "P(continues in whatever direction was just inferred)", so which one
-    it maps to (up or down) depends on which direction that currently is.
+    """Returns (p_live, live_trend_direction, p_settle_up, p_settle_down).
 
     Live: does the CURRENTLY OPEN window continue the trend established
     by the last CLOSED window -- built entirely from settled, ground-
@@ -391,12 +386,15 @@ def score_continuation_live():
     the trend it's actually predicting FROM is pointing, not the
     probability value itself.
 
-    Future: does the window AFTER NEXT continue what's forming in the
-    CURRENTLY OPEN window's own live, partial, evolving data -- the
-    currently-open window is appended as a PROVISIONAL entry, with its
-    direction INFERRED from current price vs. its own strike (an
-    approximation, since it hasn't actually settled yet). Updates
-    continuously as the window's own data accumulates.
+    p_settle_up/p_settle_down: TWO INDEPENDENT model evaluations, not one
+    score and its arithmetic complement (they are NOT constrained to sum
+    to 1) -- per explicit request. Each hypothesizes a different
+    direction for the CURRENTLY OPEN window's eventual settlement and
+    scores that scenario using the CURRENTLY OPEN window's own real,
+    already-observed data, with streak_length re-derived correctly for
+    each hypothesis. See the inline comment at the computation itself for
+    the honest caveat about what this can and can't really mean, given
+    "direction" isn't itself a trained-on feature.
 
     Uses the streak_length/lagged-feature schema (compute.py) -- no more
     chunk confirmation gate, every closed window in history contributes
@@ -431,7 +429,6 @@ def score_continuation_live():
     except Exception as e:
         log.warning(f"[continuation] live scoring failed: {e}")
 
-    p_future = None
     p_settle_up = None
     p_settle_down = None
     try:
@@ -441,37 +438,49 @@ def score_continuation_live():
                 STATE["buf"], STATE["window_id"], window_start_ts, STATE["strike_price"],
             )
             if live_summary is not None:
-                inferred_direction = 1 if live_summary["vwap"] >= STATE["strike_price"] else -1
-                provisional_rows = block_rows + [live_summary]
-                provisional_directions = directions + [inferred_direction]
-                provisional_features = build_lookback_features(provisional_rows, provisional_directions)
-                if provisional_features:
-                    future_row = provisional_features[-1]
-                    # Same override, derived correctly for this PROVISIONAL
-                    # row from the authoritative prior value.
-                    future_row["streak_length"] = compute_next_streak_length(
+                # TWO independent scoring passes, not one score and its
+                # arithmetic complement -- per explicit request. Each
+                # hypothesizes a DIFFERENT direction for the current,
+                # still-open window and asks the model to score that
+                # scenario on its own terms.
+                #
+                # Honest mechanical note: "direction" itself is NOT a
+                # model feature (excluded during training -- it only
+                # defines the label). So the only thing that actually
+                # differs between the two passes is streak_length,
+                # correctly re-derived for each hypothesis via
+                # compute_next_streak_length. Every other feature --
+                # own_vwap, own_time_above_strike, all the REAL, already-
+                # observed facts about this window -- is identical in
+                # both passes, since those don't change based on which
+                # future we're hypothesizing. This means the two results
+                # are genuinely independent model evaluations (not forced
+                # to sum to 1), but each one pairs real historical shape
+                # with a hypothesized streak_length that may not closely
+                # resemble anything the model saw in training -- flagged
+                # here deliberately, not hidden.
+                for hypothetical_direction, label in ((1, "up"), (-1, "down")):
+                    provisional_rows = block_rows + [live_summary]
+                    provisional_directions = directions + [hypothetical_direction]
+                    provisional_features = build_lookback_features(provisional_rows, provisional_directions)
+                    if not provisional_features:
+                        continue
+                    row = provisional_features[-1]
+                    row["streak_length"] = compute_next_streak_length(
                         CONTINUATION_STATE["last_streak_length"],
                         CONTINUATION_STATE["last_streak_direction"],
-                        inferred_direction,
+                        hypothetical_direction,
                     )
-                    X2 = np.array([[future_row.get(c, np.nan) for c in feature_cols]], dtype=float)
-                    p_future = float(model.predict_proba(X2)[0, 1])
-
-                    # Reframed as P(settles up)/P(settles down) for the
-                    # CURRENT block, per explicit request -- p_future is
-                    # "P(continues in whatever direction was just
-                    # inferred)"; continuing an UP-inferred block means
-                    # settling up, continuing a DOWN-inferred block means
-                    # settling down, so the mapping flips based on
-                    # inferred_direction rather than always meaning "up."
-                    if inferred_direction > 0:
-                        p_settle_up, p_settle_down = p_future, 1.0 - p_future
+                    X_h = np.array([[row.get(c, np.nan) for c in feature_cols]], dtype=float)
+                    p_h = float(model.predict_proba(X_h)[0, 1])
+                    if label == "up":
+                        p_settle_up = p_h
                     else:
-                        p_settle_down, p_settle_up = p_future, 1.0 - p_future
+                        p_settle_down = p_h
     except Exception as e:
         log.warning(f"[continuation] future scoring failed: {e}")
 
-    return p_live, p_future, live_trend_direction, p_settle_up, p_settle_down
+    return p_live, live_trend_direction, p_settle_up, p_settle_down
 
 
 def load_models():
@@ -915,9 +924,9 @@ async def live():
             log.warning(f"[serving] feature-row build failed: {e}")
 
     if CONTINUATION_STATE["model"] is not None:
-        p_live, p_future, live_trend_direction, p_settle_up, p_settle_down = score_continuation_live()
+        p_live, live_trend_direction, p_settle_up, p_settle_down = score_continuation_live()
         result["continuation"] = {
-            "p_live": p_live, "p_future": p_future, "live_trend_direction": live_trend_direction,
+            "p_live": p_live, "live_trend_direction": live_trend_direction,
             "p_settle_up": p_settle_up, "p_settle_down": p_settle_down,
         }
 
